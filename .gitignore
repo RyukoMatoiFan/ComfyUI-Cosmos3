@@ -1,0 +1,12 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Claude Code / local IDE settings (machine-specific permissions & paths)
+.claude/
+
+# Generated media / logs
+*.log
+*.mp4
+*.wav
