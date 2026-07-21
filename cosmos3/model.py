@@ -566,8 +566,12 @@ class Cosmos3OmniTransformer(nn.Module):
     #
     # Cache is keyed on the token IDs plus the patcher's patches_uuid, so a LoRA
     # change invalidates it rather than silently replaying stale K/V.
+    #
+    # Entries hold per-layer K/V on the GPU and grow with prompt length, so the
+    # cache is capped at the two a CFG pass alternates between (positive and
+    # negative). A third prompt evicts the oldest, costing one prefill.
 
-    _UND_CACHE_MAX = 4
+    _UND_CACHE_MAX = 2
 
     def _und_prefill(self, token_ids, compute_dtype, cache_key):
         """Return the per-layer [(k_und, v_und), ...] for these text tokens."""
