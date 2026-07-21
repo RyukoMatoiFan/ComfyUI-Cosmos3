@@ -185,7 +185,14 @@ def load_cosmos3_model(
 
     logger.info("Transformer loaded successfully. Wrapping in ModelPatcher...")
 
-    patcher = comfy.model_patcher.ModelPatcher(
+    # CoreModelPatcher, not ModelPatcher: main.py rebinds it to ModelPatcherDynamic
+    # at startup when comfy-aimdo is available, which is what enables dynamic VRAM.
+    # Looked up on the module at call time so the startup rebind is picked up;
+    # falls back to ModelPatcher when the dynamic class is absent.
+    patcher_cls = getattr(
+        comfy.model_patcher, "CoreModelPatcher", comfy.model_patcher.ModelPatcher
+    )
+    patcher = patcher_cls(
         model,
         load_device=load_device,
         offload_device=offload_device,
