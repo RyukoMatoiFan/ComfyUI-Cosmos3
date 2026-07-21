@@ -61,7 +61,7 @@ class Cosmos3ModelSampling(comfy.model_sampling.ModelSamplingDiscreteFlow, comfy
     def set_parameters(self, shift=10.0, timesteps=1000, multiplier=1.0):
         """Build a 1000-point uniform-flow sigma table with the discrete shift."""
         self.shift = float(shift) if shift else self._DEFAULT_SHIFT
-        self.multiplier = 1.0  # FORCE identity; never rescale sigma
+        self.multiplier = 1.0  # sigma is passed through unscaled
 
         # t in (0, 1]; s = shift*t / (1 + (shift-1)*t). Ascending so sigmas[-1] ~= 1.
         t = torch.linspace(1.0 / timesteps, 1.0, timesteps)
@@ -112,8 +112,8 @@ class Cosmos3ModelConfig(comfy.supported_models_base.BASE):
     # Supported dtypes: bf16 native, fp32 fallback
     supported_inference_dtypes = [torch.bfloat16, torch.float32]
 
-    # Memory: 16B joint-attention model, slightly heavier than WAN
-    # WAN21_T2V uses 0.9; Cosmos3 is roughly 18x heavier → keep at 1.8
+    # Scales ComfyUI's activation-memory estimate for this model's joint
+    # text+vision attention sequence. Applies to the estimate-based loading path.
     memory_usage_factor = 1.8
 
     # No clip/vae prefix (custom loader handles everything)
@@ -154,9 +154,8 @@ class Cosmos3Omni(comfy.model_base.BaseModel):
             unet_model=_get_transformer_class(),
         )
 
-        # Override model_sampling with our identity-mapping version
-        # (the base __init__ already called model_sampling() which created a
-        # ModelSamplingDiscreteFlow instance; we replace it with ours)
+        # Cosmos3 maps timestep to sigma as the identity, which the base class's
+        # ModelSamplingDiscreteFlow does not do.
         self.model_sampling = Cosmos3ModelSampling(model_config)
 
         logging.info(
@@ -214,6 +213,12 @@ class Cosmos3Omni(comfy.model_base.BaseModel):
         transformer_options = transformer_options.copy()
         transformer_options["prefetch_dynamic_vbars"] = (
             self.current_patcher is not None and self.current_patcher.is_dynamic()
+        )
+        # Weight-patch identity for the transformer's und K/V cache — changing a
+        # LoRA changes patches_uuid, which invalidates the cached prefill.
+        transformer_options["cosmos3_patches_uuid"] = (
+            str(self.current_patcher.patches_uuid)
+            if self.current_patcher is not None else None
         )
 
         # ── AV path: split packed latent, call model with sound, merge back ──
@@ -322,14 +327,7 @@ class Cosmos3Omni(comfy.model_base.BaseModel):
 
     def memory_required(self, input_shape, cond_shapes={}):
         """
-        Estimate GPU memory for lowvram budget.
-
-        Joint attention model: sequence length ≈ text_tokens + T*ceil(H/2)*ceil(W/2).
-        For default 189 frames @ 720p: seq_len ≈ 200 + 48*23*40 ≈ 44360 tokens.
-        Scale ~proportional to sequence^2 for attention.
-
-        We reuse BaseModel's formula but scale by our memory_usage_factor.
+        Estimate activation memory, using BaseModel's formula scaled by
+        memory_usage_factor.
         """
-        # Use base implementation (formula from BaseModel.memory_required)
-        # but our memory_usage_factor=1.8 is already set
         return super().memory_required(input_shape, cond_shapes)

@@ -249,91 +249,83 @@ class Cosmos3PackedMoTAttention(nn.Module):
         self.norm_added_k = ops.RMSNorm(head_dim, eps=rms_norm_eps,
                                          elementwise_affine=True, device=device, dtype=dtype)
 
-    def forward(self, und_seq, gen_seq,
-                cos_und, sin_und, cos_gen, sin_gen):
+    def forward_und(self, und_seq, cos_und, sin_und):
         """
-        und_seq: [L_text, D]
-        gen_seq: [L_gen, D]
+        Prefill: causal self-attention over text tokens only.
+
+        und_seq:     [L_text, D]
         cos/sin_und: [L_text, head_dim]
-        cos/sin_gen: [L_gen, head_dim]
-        Returns (und_out, gen_out) each same shape as inputs.
+        Returns (und_out [L_text, D], k_und [L_text, H_kv, d], v_und [L_text, H_kv, d]).
+
+        The returned K/V are post-QK-norm and post-RoPE, i.e. exactly what the gen
+        pathway concatenates onto its own K/V — so they can be cached and replayed.
         """
         H_q  = self.num_attention_heads
         H_kv = self.num_key_value_heads
         d    = self.head_dim
         n_rep = H_q // H_kv
 
-        # --- Projections ---
-        q_und = self.to_q(und_seq).view(-1, H_q, d)   # [L_t, H_q, d]
-        k_und = self.to_k(und_seq).view(-1, H_kv, d)  # [L_t, H_kv, d]
+        q_und = self.norm_q(self.to_q(und_seq).view(-1, H_q, d))
+        k_und = self.norm_k(self.to_k(und_seq).view(-1, H_kv, d))
         v_und = self.to_v(und_seq).view(-1, H_kv, d)
 
-        q_gen = self.add_q_proj(gen_seq).view(-1, H_q, d)
-        k_gen = self.add_k_proj(gen_seq).view(-1, H_kv, d)
+        cos_ = cos_und.unsqueeze(1)  # [L_t, 1, head_dim]
+        sin_ = sin_und.unsqueeze(1)
+        q_und = q_und * cos_ + _rotate_half(q_und) * sin_
+        k_und = k_und * cos_ + _rotate_half(k_und) * sin_
+
+        L_t = und_seq.shape[0]
+        k_rep = k_und.repeat_interleave(n_rep, dim=1)  # [L_t, H_q, d]
+        v_rep = v_und.repeat_interleave(n_rep, dim=1)
+
+        causal_out_4d = F.scaled_dot_product_attention(
+            q_und.unsqueeze(0).permute(0, 2, 1, 3),   # [1, H_q, L_t, d]
+            k_rep.unsqueeze(0).permute(0, 2, 1, 3),
+            v_rep.unsqueeze(0).permute(0, 2, 1, 3),
+            is_causal=True,
+        )
+        causal_out = causal_out_4d.permute(0, 2, 1, 3).reshape(L_t, H_q * d)
+
+        return self.to_out(causal_out), k_und, v_und
+
+    def forward_gen(self, gen_seq, k_und, v_und, cos_gen, sin_gen):
+        """
+        Denoise step: full attention over KV = concat(cached und, gen).
+
+        gen_seq:     [L_gen, D]
+        k_und/v_und: [L_text, H_kv, d] from forward_und (cached across steps)
+        cos/sin_gen: [L_gen, head_dim]
+        Returns gen_out [L_gen, D].
+        """
+        H_q  = self.num_attention_heads
+        H_kv = self.num_key_value_heads
+        d    = self.head_dim
+        n_rep = H_q // H_kv
+
+        q_gen = self.norm_added_q(self.add_q_proj(gen_seq).view(-1, H_q, d))
+        k_gen = self.norm_added_k(self.add_k_proj(gen_seq).view(-1, H_kv, d))
         v_gen = self.add_v_proj(gen_seq).view(-1, H_kv, d)
 
-        # --- QK norm (per-head, on head_dim) ---
-        q_und = self.norm_q(q_und)
-        k_und = self.norm_k(k_und)
-        q_gen = self.norm_added_q(q_gen)
-        k_gen = self.norm_added_k(k_gen)
+        cos_ = cos_gen.unsqueeze(1)  # [L_g, 1, head_dim]
+        sin_ = sin_gen.unsqueeze(1)
+        q_gen = q_gen * cos_ + _rotate_half(q_gen) * sin_
+        k_gen = k_gen * cos_ + _rotate_half(k_gen) * sin_
 
-        # --- RoPE application ---
-        cos_und_ = cos_und.unsqueeze(1)  # [L_t, 1, head_dim]
-        sin_und_ = sin_und.unsqueeze(1)
-        q_und = q_und * cos_und_ + _rotate_half(q_und) * sin_und_
-        k_und = k_und * cos_und_ + _rotate_half(k_und) * sin_und_
+        all_k = torch.cat([k_und.to(k_gen.dtype), k_gen], dim=0)  # [L_all, H_kv, d]
+        all_v = torch.cat([v_und.to(v_gen.dtype), v_gen], dim=0)
 
-        cos_gen_ = cos_gen.unsqueeze(1)  # [L_g, 1, head_dim]
-        sin_gen_ = sin_gen.unsqueeze(1)
-        q_gen = q_gen * cos_gen_ + _rotate_half(q_gen) * sin_gen_
-        k_gen = k_gen * cos_gen_ + _rotate_half(k_gen) * sin_gen_
-
-        # --- Causal text attention (und pathway, GQA via repeat) ---
-        # optimized_attention expects [B, L, H*d] flat
-        L_t = und_seq.shape[0]
-        # repeat KV heads for GQA
-        k_und_rep = k_und.repeat_interleave(n_rep, dim=1)  # [L_t, H_q, d]
-        v_und_rep = v_und.repeat_interleave(n_rep, dim=1)
-
-        q_und_flat = q_und.view(1, L_t, H_q * d)
-        k_und_flat = k_und_rep.view(1, L_t, H_q * d)
-        v_und_flat = v_und_rep.view(1, L_t, H_q * d)
-
-        # Causal mask for text
-        causal_mask = torch.triu(
-            torch.full((L_t, L_t), float('-inf'), dtype=q_und.dtype, device=q_und.device),
-            diagonal=1
-        )
-        # Use pytorch SDPA for causal text attention (mask-based for compatibility)
-        q_und_4d = q_und.unsqueeze(0).permute(0, 2, 1, 3)  # [1, H_q, L_t, d]
-        k_und_4d = k_und_rep.unsqueeze(0).permute(0, 2, 1, 3)
-        v_und_4d = v_und_rep.unsqueeze(0).permute(0, 2, 1, 3)
-        causal_out_4d = F.scaled_dot_product_attention(
-            q_und_4d, k_und_4d, v_und_4d, is_causal=True
-        )
-        causal_out = causal_out_4d.permute(0, 2, 1, 3).reshape(1, L_t, H_q * d)
-
-        # --- Full attention (gen pathway, KV = concat(und, gen)) ---
-        L_g = gen_seq.shape[0]
-        L_all = L_t + L_g
-        all_k = torch.cat([k_und, k_gen], dim=0)  # [L_all, H_kv, d]
-        all_v = torch.cat([v_und, v_gen], dim=0)
-
-        # Repeat KV heads
         all_k_rep = all_k.repeat_interleave(n_rep, dim=1)  # [L_all, H_q, d]
         all_v_rep = all_v.repeat_interleave(n_rep, dim=1)
 
-        q_gen_flat  = q_gen.view(1, L_g, H_q * d)
-        k_all_flat  = all_k_rep.view(1, L_all, H_q * d)
-        v_all_flat  = all_v_rep.view(1, L_all, H_q * d)
-
-        full_out = optimized_attention(q_gen_flat, k_all_flat, v_all_flat, heads=H_q)
-        # full_out: [1, L_g, H_q*d]
-
-        und_out = self.to_out(causal_out.squeeze(0))    # [L_t, D]
-        gen_out = self.to_add_out(full_out.squeeze(0))  # [L_g, D]
-        return und_out, gen_out
+        L_g = gen_seq.shape[0]
+        L_all = all_k.shape[0]
+        full_out = optimized_attention(
+            q_gen.view(1, L_g, H_q * d),
+            all_k_rep.view(1, L_all, H_q * d),
+            all_v_rep.view(1, L_all, H_q * d),
+            heads=H_q,
+        )
+        return self.to_add_out(full_out.squeeze(0))  # [L_g, D]
 
 
 # ---------------------------------------------------------------------------
@@ -375,25 +367,23 @@ class Cosmos3DecoderLayer(nn.Module):
             hidden_size, eps=rms_norm_eps, elementwise_affine=True,
             device=device, dtype=dtype)
 
-    def forward(self, und_seq, gen_seq, cos_und, sin_und, cos_gen, sin_gen):
-        # Pre-norm
-        und_norm = self.input_layernorm(und_seq)
-        gen_norm = self.input_layernorm_moe_gen(gen_seq)
-
-        # Dual-pathway attention
-        und_attn, gen_attn = self.self_attn(
-            und_norm, gen_norm, cos_und, sin_und, cos_gen, sin_gen
+    def forward_und(self, und_seq, cos_und, sin_und):
+        """Prefill the und pathway. Returns (und_seq_next, k_und, v_und)."""
+        und_attn, k_und, v_und = self.self_attn.forward_und(
+            self.input_layernorm(und_seq), cos_und, sin_und
         )
-
-        # Residual
         und_seq = und_seq + und_attn
-        gen_seq = gen_seq + gen_attn
-
-        # MLP + residual
         und_seq = und_seq + self.mlp(self.post_attention_layernorm(und_seq))
-        gen_seq = gen_seq + self.mlp_moe_gen(self.post_attention_layernorm_moe_gen(gen_seq))
+        return und_seq, k_und, v_und
 
-        return und_seq, gen_seq
+    def forward_gen(self, gen_seq, k_und, v_und, cos_gen, sin_gen):
+        """Gen-only step against cached und K/V. Touches no und weights."""
+        gen_attn = self.self_attn.forward_gen(
+            self.input_layernorm_moe_gen(gen_seq), k_und, v_und, cos_gen, sin_gen
+        )
+        gen_seq = gen_seq + gen_attn
+        gen_seq = gen_seq + self.mlp_moe_gen(self.post_attention_layernorm_moe_gen(gen_seq))
+        return gen_seq
 
 
 # ---------------------------------------------------------------------------
@@ -555,6 +545,54 @@ class Cosmos3OmniTransformer(nn.Module):
                         dtype=dtype if dtype is not None else torch.float32)
         )
 
+        # Understanding-tower K/V cache — see _und_prefill.
+        self._und_kv_cache = {}
+
+    # ------------------------------------------------------------------
+    # Understanding-tower prefill
+    # ------------------------------------------------------------------
+    #
+    # The und pathway attends only to itself (forward_und is causal over text
+    # alone) and never sees the timestep or the latent, so its per-layer K/V are
+    # invariant across denoising steps. They are computed once per prompt and
+    # replayed for every step, which also confines the und weights to a single
+    # step's access pattern.
+    #
+    # Cache is keyed on the token IDs plus the patcher's patches_uuid, so a LoRA
+    # change invalidates it rather than silently replaying stale K/V.
+
+    _UND_CACHE_MAX = 4
+
+    def _und_prefill(self, token_ids, compute_dtype, cache_key):
+        """Return the per-layer [(k_und, v_und), ...] for these text tokens."""
+        cached = self._und_kv_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        device = token_ids.device
+        L_text = token_ids.shape[0]
+
+        # Text mRoPE ids are arange(L_text) on all three axes and independent of
+        # the vision/sound segments, so the rotary tables can be built here.
+        # RoPE is applied per position, so this matches the joint computation.
+        text_mrope_ids, _ = _get_mrope_ids_text(L_text, temporal_offset=0)
+        cos, sin = self.rotary_emb(
+            position_ids=text_mrope_ids.to(device), device=device, dtype=compute_dtype
+        )
+        cos_und = cos.squeeze(0)  # [L_text, head_dim]
+        sin_und = sin.squeeze(0)
+
+        und_seq = self.embed_tokens(token_ids).to(compute_dtype)  # [L_text, D]
+        und_kv = []
+        for layer in self.layers:
+            und_seq, k_und, v_und = layer.forward_und(und_seq, cos_und, sin_und)
+            und_kv.append((k_und, v_und))
+
+        if len(self._und_kv_cache) >= self._UND_CACHE_MAX:
+            self._und_kv_cache.pop(next(iter(self._und_kv_cache)))
+        self._und_kv_cache[cache_key] = und_kv
+        return und_kv
+
     # ------------------------------------------------------------------
     # Patchify / unpatchify (ported exactly from reference)
     # ------------------------------------------------------------------
@@ -631,6 +669,10 @@ class Cosmos3OmniTransformer(nn.Module):
 
         has_sound = cosmos3_sound_latent is not None
 
+        # Identifies the current weight-patch state; part of the und cache key so a
+        # LoRA change invalidates the cache instead of replaying stale K/V.
+        patches_uuid = transformer_options.get("cosmos3_patches_uuid", None)
+
         # Parse token IDs: (B, n_tokens, 1) float -> list of 1D long tensors
         token_ids_list = []
         for b in range(B):
@@ -702,19 +744,22 @@ class Cosmos3OmniTransformer(nn.Module):
                 end   = start + spatial_numel
                 patches_proj[start:end] = patches_proj[start:end] + time_embed
 
-            # Build joint sequence
-            token_ids = token_ids_list[b]   # [L_text]
+            # Prefill (or reuse) the und tower for this prompt
+            token_ids = token_ids_list[b].to(x.device)   # [L_text]
             L_text = token_ids.shape[0]
 
-            text_hidden = self.embed_tokens(token_ids.to(x.device)).to(compute_dtype)  # [L_text, D]
+            cache_key = (
+                patches_uuid,
+                str(compute_dtype),
+                str(x.device),
+                token_ids.detach().cpu().numpy().tobytes(),
+            )
+            und_kv = self._und_prefill(token_ids, compute_dtype, cache_key)
+
             L_vision = patches_proj.shape[0]  # T*Hp*Wp
 
-            und_len = L_text
-
-            # Build mRoPE position IDs
-            # Text: offset starts at 0
-            text_mrope_ids, next_offset = _get_mrope_ids_text(L_text, temporal_offset=0)
-            # Vision AND sound both use the same temporal offset base = und_len + mrope_margin
+            # Build mRoPE position IDs for the gen segments.
+            # Vision AND sound both use the same temporal offset base = L_text + mrope_margin
             # (they are temporal siblings, not sequential — see _prepare_text_segment in pipeline)
             modality_temporal_offset = L_text + self.mrope_margin
             vision_mrope_ids, _ = _get_mrope_ids_vision(
@@ -757,47 +802,29 @@ class Cosmos3OmniTransformer(nn.Module):
 
                 # gen sequence = [vision | sound]
                 gen_hidden = torch.cat([patches_proj, sound_tokens], dim=0)  # [L_vision+T_s, D]
-                vision_sound_mrope_ids = torch.cat(
+                gen_position_ids = torch.cat(
                     [vision_mrope_ids.to(x.device), sound_mrope_ids.to(x.device)], dim=1
                 )  # [3, L_vision + T_s]
-
-                # Full position_ids: [3, L_text + L_vision + T_s]
-                position_ids = torch.cat(
-                    [text_mrope_ids.to(x.device), vision_sound_mrope_ids], dim=1
-                )
             else:
                 gen_hidden = patches_proj  # [L_vision, D]
-                position_ids = torch.cat(
-                    [text_mrope_ids.to(x.device),
-                     vision_mrope_ids.to(x.device)], dim=1
-                )  # [3, L_text + L_vision]
+                gen_position_ids = vision_mrope_ids.to(x.device)  # [3, L_vision]
 
-            L_gen = gen_hidden.shape[0]
-
-            # Compute rotary embeddings for full sequence
-            cos, sin = self.rotary_emb(
-                position_ids=position_ids.unsqueeze(1) if position_ids.ndim == 2 else position_ids,
+            # Rotary embeddings for the gen segment. The und segment's tables were
+            # built during prefill; RoPE is per-position so splitting is exact.
+            cos_gen, sin_gen = self.rotary_emb(
+                position_ids=gen_position_ids,
                 device=x.device,
                 dtype=compute_dtype,
             )
-            # cos, sin: [1, total_len, head_dim]
-            cos = cos.squeeze(0)  # [total_len, head_dim]
-            sin = sin.squeeze(0)
+            cos_gen = cos_gen.squeeze(0)  # [L_gen, head_dim]
+            sin_gen = sin_gen.squeeze(0)
 
-            cos_und = cos[:L_text]
-            sin_und = sin[:L_text]
-            cos_gen = cos[L_text:]
-            sin_gen = sin[L_text:]
-
-            # Run transformer layers
-            und_seq = text_hidden  # [L_text, D]
+            # Run transformer layers — gen pathway only, replaying cached und K/V
             gen_seq = gen_hidden   # [L_gen, D]  (vision + optional sound)
 
-            for layer in self.layers:
-                und_seq, gen_seq = layer(und_seq, gen_seq,
-                                          cos_und, sin_und, cos_gen, sin_gen)
+            for layer, (k_und, v_und) in zip(self.layers, und_kv):
+                gen_seq = layer.forward_gen(gen_seq, k_und, v_und, cos_gen, sin_gen)
 
-            # Final norms (und_seq discarded — text output not needed for video)
             gen_out = self.norm_moe_gen(gen_seq)  # [L_gen, D]
 
             # --- Vision output ---
