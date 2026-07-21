@@ -50,9 +50,10 @@
         "Node name for S&R": "Cosmos3Loader"
       },
       "widgets_values": [
-        "Cosmos3-Nano",
+        "Cosmos3-Super-Image2Video",
         "default"
-      ]
+      ],
+      "title": "Cosmos3 Loader (Super)"
     },
     {
       "id": 2,
@@ -94,7 +95,7 @@
         832,
         480,
         93,
-        24.0,
+        16.0,
         true,
         true
       ]
@@ -183,7 +184,7 @@
         832,
         480,
         93,
-        24.0,
+        16.0,
         true,
         true
       ]
@@ -584,7 +585,7 @@
         "Node name for S&R": "CreateVideo"
       },
       "widgets_values": [
-        24.0
+        16.0
       ]
     },
     {

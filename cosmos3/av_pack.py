@@ -127,33 +127,6 @@ def unpack_sound(
 # mean, std shapes are (1, 48, 1, 1, 1).  We reshape to (1, 48, 1, 1, 1) for
 # broadcasting over (B, 48, n_extra, H, W).
 
-def unnorm_packed_region(
-    region: torch.Tensor,          # (B, 48, n_extra, H, W)  — normalised
-    latents_mean: torch.Tensor,    # (1, 48, 1, 1, 1)
-    latents_std: torch.Tensor,     # (1, 48, 1, 1, 1)
-) -> torch.Tensor:
-    """Un-normalise a packed tail region and extract the raw sound latent.
-
-    Step 1: region_raw = region * std + mean     (invert process_in)
-    Step 2: flatten C-contiguous → take first SOUND_DIM*T_s elements
-    Step 3: reshape → (B, 64, T_s)
-    """
-    B, C, n_extra, H, W = region.shape
-    mean = latents_mean.to(dtype=region.dtype, device=region.device)
-    std  = latents_std.to(dtype=region.dtype, device=region.device)
-
-    # Un-normalise (invert process_in: x_raw = x_norm * std + mean)
-    region_raw = region * std + mean  # (B, 48, n_extra, H, W)
-
-    # Flatten C-contiguous over (C, n_extra, H, W)
-    tail_flat = region_raw.reshape(B, C * n_extra * H * W)
-
-    # Determine T_s from available elements
-    numel_sound = tail_flat.shape[1]  # upper bound
-    # Caller must know T_s; we return the whole flat view and let caller slice
-    return region_raw, tail_flat
-
-
 def region_to_sound_raw(
     region: torch.Tensor,          # (B, 48, n_extra, H, W) — normalised
     latents_mean: torch.Tensor,    # (1, 48, 1, 1, 1)
@@ -210,6 +183,4 @@ def sound_raw_to_region_velocity(
     # Divide by std (velocity transform: NO mean)
     tail = tail / std   # broadcast over (B, 48, n_extra, H, W)
 
-    # Zero out padding positions in normalised space (they were zero in raw space
-    # so raw/std could produce NaN if std=0; all Wan22 stds are positive, so fine)
     return tail

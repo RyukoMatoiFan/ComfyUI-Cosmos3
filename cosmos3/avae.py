@@ -6,7 +6,7 @@ AVAE (Audio VAE) decoder-only wrapper for Cosmos3 sound generation.
 Ports the Cosmos3AVAEAudioTokenizer DECODER from the HuggingFace diffusers
 Cosmos3 implementation as a pure-torch module with no diffusers imports.
 
-Module tree matches keys_sound_tokenizer.txt EXACTLY:
+Module tree (matching the sound_tokenizer checkpoint key names):
   decoder.conv1           — weight_norm Conv1d(64, 5120, 7)
   decoder.block.{0-4}     — Cosmos3AudioDecoderBlock with weight_norm convs
   decoder.snake1          — Snake1d(320)
@@ -30,18 +30,10 @@ Strides in Cosmos3AudioDecoder.__init__:
   block[3]: 640→320,   stride=4
   block[4]: 320→320,   stride=2
   (channel_multiples = [1]+dec_c_mults = [1,1,2,4,8,16])
-  Wait: input_dim = channels * channel_multiples[len(strides) - stride_index]
-  For stride_index 0: channels(320) * channel_multiples[5] = 320*16 = 5120
-  For stride_index 1: 320 * channel_multiples[4] = 320*8 = 2560
-  For stride_index 2: 320 * channel_multiples[3] = 320*4 = 1280
-  For stride_index 3: 320 * channel_multiples[2] = 320*2 = 640
-  For stride_index 4: 320 * channel_multiples[1] = 320*1 = 320
-  output_dim:
-  For stride_index 0: 320 * channel_multiples[4] = 2560
-  For stride_index 1: 320 * channel_multiples[3] = 1280
-  For stride_index 2: 320 * channel_multiples[2] = 640
-  For stride_index 3: 320 * channel_multiples[1] = 320
-  For stride_index 4: 320 * channel_multiples[0] = 320
+
+  Per-block channel counts follow:
+    input_dim  = channels * channel_multiples[len(strides) - stride_index]
+    output_dim = channels * channel_multiples[len(strides) - stride_index - 1]
   output_padding = stride % 2:
   [0, 8%2=0, 6%2=0, 5%2=1, 4%2=0, 2%2=0] → strides [8,6,5,4,2] → [0,0,1,0,0]
 
