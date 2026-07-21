@@ -455,6 +455,8 @@ class Cosmos3OmniTransformer(nn.Module):
         # accept but ignore rope_scaling dict for caller convenience
         rope_scaling=None,
         patch_latent_dim: int = 192,
+        sound_gen: bool = True,
+        sound_dim: int = 64,
         **kwargs,
     ):
         super().__init__()
@@ -531,19 +533,23 @@ class Cosmos3OmniTransformer(nn.Module):
             device=device, dtype=dtype, operations=ops,
         )
 
-        # Audio generation modules — exact checkpoint key names from keys_transformer.txt:
-        #   audio_proj_in.weight [4096,64], audio_proj_in.bias [4096]
-        #   audio_proj_out.weight [64,4096], audio_proj_out.bias [64]
-        #   audio_modality_embed [4096]
-        self.audio_proj_in  = ops.Linear(64, hidden_size, bias=True,
-                                          device=device, dtype=dtype)
-        self.audio_proj_out = ops.Linear(hidden_size, 64, bias=True,
-                                          device=device, dtype=dtype)
-        # nn.Parameter so the key name is "audio_modality_embed" (not .weight)
-        self.audio_modality_embed = nn.Parameter(
-            torch.zeros(hidden_size, device=device,
-                        dtype=dtype if dtype is not None else torch.float32)
-        )
+        # Audio generation modules — names match the transformer checkpoint keys:
+        #   audio_proj_in.weight [D,sound_dim], audio_proj_in.bias [D]
+        #   audio_proj_out.weight [sound_dim,D], audio_proj_out.bias [sound_dim]
+        #   audio_modality_embed [D]
+        # Built only for checkpoints that generate sound; image/video-only
+        # checkpoints ship none of these keys.
+        self.sound_gen = bool(sound_gen) and sound_dim is not None
+        if self.sound_gen:
+            self.audio_proj_in  = ops.Linear(sound_dim, hidden_size, bias=True,
+                                              device=device, dtype=dtype)
+            self.audio_proj_out = ops.Linear(hidden_size, sound_dim, bias=True,
+                                              device=device, dtype=dtype)
+            # nn.Parameter so the key name is "audio_modality_embed" (not .weight)
+            self.audio_modality_embed = nn.Parameter(
+                torch.zeros(hidden_size, device=device,
+                            dtype=dtype if dtype is not None else torch.float32)
+            )
 
         # Understanding-tower K/V cache — see _und_prefill.
         self._und_kv_cache = {}
@@ -668,6 +674,12 @@ class Cosmos3OmniTransformer(nn.Module):
         compute_dtype = x.dtype
 
         has_sound = cosmos3_sound_latent is not None
+        if has_sound and not self.sound_gen:
+            raise ValueError(
+                "This checkpoint has no audio branch (sound_gen is disabled in "
+                "transformer/config.json), so it cannot generate sound. Use the "
+                "plain video latent nodes instead of the AV ones."
+            )
 
         # Identifies the current weight-patch state; part of the und cache key so a
         # LoRA change invalidates the cache instead of replaying stale K/V.

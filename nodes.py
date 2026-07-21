@@ -89,8 +89,14 @@ class Cosmos3Loader:
         model = load_model(model_dir, weight_dtype)
         vae = load_vae(model_dir)
         text_encoder = load_tokenizer(model_dir)
-        Cosmos3AudioVAE = _get_avae()
-        audio_vae = Cosmos3AudioVAE(model_dir)
+
+        # Video-only checkpoints ship no sound tokenizer; the audio_vae output
+        # is then None and the audio nodes are not usable with this model.
+        audio_vae = None
+        if os.path.isdir(os.path.join(model_dir, "sound_tokenizer")):
+            Cosmos3AudioVAE = _get_avae()
+            audio_vae = Cosmos3AudioVAE(model_dir)
+
         return (model, text_encoder, vae, audio_vae)
 
 
@@ -130,8 +136,7 @@ class Cosmos3TextEncode:
                 }),
                 "num_frames": ("INT", {
                     "default": 189, "min": 1, "max": 401, "step": 4,
-                    "tooltip": "Number of video frames. 189 = 7.9 s @ 24 fps. "
-                               "Use 93 frames (~3.9 s) for lower VRAM.",
+                    "tooltip": "Number of video frames. 189 = 7.9 s @ 24 fps.",
                 }),
                 "fps": ("FLOAT", {
                     "default": 24.0, "min": 1.0, "max": 120.0, "step": 0.5,
@@ -180,7 +185,7 @@ class Cosmos3DefaultNegativePrompt:
     and returns it as a STRING that can be wired into Cosmos3TextEncode's
     prompt input.
 
-    If the file is absent (e.g. during testing), returns an empty string.
+    Returns an empty string if the checkpoint ships without that file.
     """
 
     @classmethod

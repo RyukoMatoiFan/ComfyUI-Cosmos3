@@ -56,8 +56,8 @@ def _should_skip_fp8(key: str, tensor: torch.Tensor) -> bool:
 # Key prefixes to drop from transformer state dict
 # ---------------------------------------------------------------------------
 
-# Drop: lm_head.*, action_* (DomainAwareLinear action head not implemented)
-# KEEP: audio_proj_in.*, audio_proj_out.*, audio_modality_embed (audio branch is implemented)
+# Drop: lm_head.*, action_* (the action head is not used by this port)
+# KEEP: audio_proj_in.*, audio_proj_out.*, audio_modality_embed (used by the audio branch)
 _FILTER_PREFIXES = ("lm_head.", "action_")
 # Also drop rotary inv_freq buffers
 _FILTER_SUFFIXES = ("rotary_emb.inv_freq",)
@@ -83,6 +83,76 @@ def _filter_transformer_keys(sd: Dict[str, torch.Tensor]) -> Dict[str, torch.Ten
 
 
 # ---------------------------------------------------------------------------
+# Checkpoint config -> transformer kwargs
+# ---------------------------------------------------------------------------
+
+# config.json keys the Cosmos3OmniTransformer constructor accepts verbatim.
+# "dtype" is deliberately excluded: it is a string in the checkpoint config,
+# while ComfyUI puts the torch dtype under that key via set_inference_dtype.
+_CONFIG_PASSTHROUGH = (
+    "hidden_size", "num_hidden_layers", "num_attention_heads",
+    "num_key_value_heads", "head_dim", "intermediate_size",
+    "latent_channel", "latent_patch_size", "vocab_size", "rope_theta",
+    "rope_scaling", "base_fps", "enable_fps_modulation", "timestep_scale",
+    "rms_norm_eps", "patch_latent_dim", "sound_gen", "sound_dim",
+)
+
+# Keys whose checkpoint name differs from the constructor parameter name.
+_CONFIG_KEY_ALIASES = {
+    "unified_3d_mrope_temporal_modality_margin": "mrope_margin",
+}
+
+
+def _load_transformer_config(transformer_dir: str) -> Dict:
+    """Read transformer/config.json into Cosmos3OmniTransformer kwargs.
+
+    Lets one loader cover checkpoints with different widths, depths and
+    modalities (e.g. Nano generates sound, Super does not).
+    """
+    path = os.path.join(transformer_dir, "config.json")
+    with open(path, "r", encoding="utf-8") as f:
+        raw = json.load(f)
+
+    cfg = {k: raw[k] for k in _CONFIG_PASSTHROUGH if k in raw}
+    for src, dst in _CONFIG_KEY_ALIASES.items():
+        if src in raw:
+            cfg[dst] = raw[src]
+    return cfg
+
+
+# Shard index filenames, in the order they are probed.
+_INDEX_FILENAMES = (
+    "diffusion_pytorch_model.safetensors.index.json",
+    "model.safetensors.index.json",
+)
+_SINGLE_FILENAMES = (
+    "diffusion_pytorch_model.safetensors",
+    "model.safetensors",
+)
+
+
+def _resolve_shard_files(transformer_dir: str):
+    """Return the transformer's safetensors files, sharded or single-file."""
+    for name in _INDEX_FILENAMES:
+        index_path = os.path.join(transformer_dir, name)
+        if os.path.exists(index_path):
+            with open(index_path, "r", encoding="utf-8") as f:
+                index = json.load(f)
+            shards = sorted(set(index["weight_map"].values()))
+            return [os.path.join(transformer_dir, s) for s in shards]
+
+    for name in _SINGLE_FILENAMES:
+        single = os.path.join(transformer_dir, name)
+        if os.path.exists(single):
+            return [single]
+
+    raise FileNotFoundError(
+        f"No transformer weights found in {transformer_dir}. Expected one of "
+        f"{_INDEX_FILENAMES} or {_SINGLE_FILENAMES}."
+    )
+
+
+# ---------------------------------------------------------------------------
 # load_cosmos3_model
 # ---------------------------------------------------------------------------
 
@@ -91,81 +161,77 @@ def load_cosmos3_model(
     weight_dtype: str = "default",
 ) -> comfy.model_patcher.ModelPatcher:
     """
-    Load Cosmos3 Omni Nano transformer from model_dir.
+    Load a Cosmos3 Omni transformer from model_dir.
+
+    The architecture is taken from transformer/config.json, so this covers both
+    Cosmos3-Nano and the larger Cosmos3-Super checkpoints.
 
     Args:
-        model_dir: Path to the Cosmos3-Nano checkpoint root (absolute path, or a bare
-                   folder name resolved under ComfyUI/models/cosmos3/).
+        model_dir: Path to the checkpoint root (absolute path, or a bare folder
+                   name resolved under ComfyUI/models/cosmos3/).
         weight_dtype: "default" (keep bf16) or "fp8_e4m3fn" (cast linear weights to fp8).
 
     Returns:
         comfy.model_patcher.ModelPatcher wrapping a Cosmos3Omni model.
     """
     transformer_dir = os.path.join(model_dir, "transformer")
-    index_path = os.path.join(transformer_dir, "diffusion_pytorch_model.safetensors.index.json")
 
-    # Load shard index
-    logger.info("Loading transformer shard index from %s", index_path)
-    with open(index_path, "r", encoding="utf-8") as f:
-        index = json.load(f)
+    unet_config = _load_transformer_config(transformer_dir)
+    logger.info(
+        "Transformer config: hidden_size=%s layers=%s heads=%s sound_gen=%s",
+        unet_config.get("hidden_size"), unet_config.get("num_hidden_layers"),
+        unet_config.get("num_attention_heads"), unet_config.get("sound_gen", True),
+    )
 
-    # Collect unique shard files
-    shard_files = sorted(set(index["weight_map"].values()))
-    logger.info("Loading %d transformer shards...", len(shard_files))
+    shard_paths = _resolve_shard_files(transformer_dir)
+    logger.info("Found %d transformer shard(s)", len(shard_paths))
 
-    # Merge all shards
-    sd: Dict[str, torch.Tensor] = {}
-    for shard_file in shard_files:
-        shard_path = os.path.join(transformer_dir, shard_file)
-        logger.info("  Loading %s", shard_file)
-        shard_sd = comfy.utils.load_torch_file(shard_path, safe_load=True)
-        sd.update(shard_sd)
-        del shard_sd
-
-    logger.info("Merged %d raw keys from transformer shards", len(sd))
-
-    # Filter out unused modules
-    sd = _filter_transformer_keys(sd)
-    logger.info("After filtering: %d keys", len(sd))
-
-    # Determine dtype and operations
     if weight_dtype == "fp8_e4m3fn":
-        compute_dtype = torch.bfloat16
-        # Cast eligible weights to fp8
-        fp8_keys = []
-        for k in list(sd.keys()):
-            t = sd[k]
-            if not _should_skip_fp8(k, t):
-                sd[k] = t.to(torch.float8_e4m3fn)
-                fp8_keys.append(k)
-        logger.info("Cast %d weights to fp8_e4m3fn", len(fp8_keys))
-        manual_cast_dtype = compute_dtype
         unet_dtype = torch.float8_e4m3fn
+        manual_cast_dtype = torch.bfloat16
     else:
-        # Keep bf16 native
         unet_dtype = torch.bfloat16
         manual_cast_dtype = None
 
-    # Build model config
-    model_config = Cosmos3ModelConfig({})
+    model_config = Cosmos3ModelConfig(unet_config)
     model_config.set_inference_dtype(unet_dtype, manual_cast_dtype)
 
-    # Compute devices
     offload_device = comfy.model_management.unet_offload_device()
     load_device = comfy.model_management.get_torch_device()
 
-    # Instantiate model on offload device (CPU) for initial weight loading
     logger.info("Creating Cosmos3Omni model on %s...", offload_device)
     model = Cosmos3Omni(model_config, device=offload_device)
+    target = model.diffusion_model
 
-    # Load weights using BaseModel.load_model_weights
-    # Our keys have no prefix so unet_prefix=""
-    logger.info("Loading weights into model (strict check)...")
-    # Use strict=False via load_model_weights, but manually assert missing
-    # We call diffusion_model.load_state_dict directly for full control
-    to_load = model_config.process_unet_state_dict(sd)
-    missing, unexpected = model.diffusion_model.load_state_dict(to_load, strict=False)
+    # Copy one shard at a time and release it, so only one shard is held in
+    # memory alongside the model.
+    expected = set(target.state_dict().keys())
+    loaded = set()
+    unexpected_all = []
+    fp8_count = 0
 
+    for shard_path in shard_paths:
+        logger.info("  Loading %s", os.path.basename(shard_path))
+        shard = comfy.utils.load_torch_file(shard_path, safe_load=True)
+        shard = _filter_transformer_keys(shard)
+
+        if weight_dtype == "fp8_e4m3fn":
+            for k in list(shard.keys()):
+                t = shard[k]
+                if not _should_skip_fp8(k, t):
+                    shard[k] = t.to(torch.float8_e4m3fn)
+                    fp8_count += 1
+
+        shard = model_config.process_unet_state_dict(shard)
+        _, unexpected = target.load_state_dict(shard, strict=False)
+        loaded.update(k for k in shard if k in expected)
+        unexpected_all.extend(unexpected)
+        del shard
+
+    if weight_dtype == "fp8_e4m3fn":
+        logger.info("Cast %d weights to fp8_e4m3fn", fp8_count)
+
+    missing = sorted(expected - loaded)
     if missing:
         logger.error("MISSING keys in transformer (%d): %s", len(missing), missing[:20])
         raise RuntimeError(
@@ -173,22 +239,19 @@ def load_cosmos3_model(
             f"First few: {missing[:5]}"
         )
 
-    if unexpected:
+    if unexpected_all:
         logger.warning(
             "Unexpected keys in transformer (%d): %s",
-            len(unexpected),
-            unexpected[:10],
+            len(unexpected_all),
+            unexpected_all[:10],
         )
-
-    # Free state dict
-    del sd, to_load
 
     logger.info("Transformer loaded successfully. Wrapping in ModelPatcher...")
 
     # CoreModelPatcher, not ModelPatcher: main.py rebinds it to ModelPatcherDynamic
-    # at startup when comfy-aimdo is available, which is what enables dynamic VRAM.
+    # at startup when comfy-aimdo is available, which is what gives us dynamic VRAM.
     # Looked up on the module at call time so the startup rebind is picked up;
-    # falls back to ModelPatcher when the dynamic class is absent.
+    # falls back to ModelPatcher on ComfyUI versions predating the dynamic path.
     patcher_cls = getattr(
         comfy.model_patcher, "CoreModelPatcher", comfy.model_patcher.ModelPatcher
     )
