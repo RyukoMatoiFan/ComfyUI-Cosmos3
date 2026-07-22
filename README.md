@@ -10,7 +10,9 @@ Supported checkpoints:
 | Checkpoint | Verified paths |
 |---|---|
 | [`nvidia/Cosmos3-Nano`](https://huggingface.co/nvidia/Cosmos3-Nano) | text → video, image → video, joint audio-video |
+| [`nvidia/Cosmos3-Super`](https://huggingface.co/nvidia/Cosmos3-Super) | text → video, image → video, joint audio-video |
 | [`nvidia/Cosmos3-Super-Image2Video`](https://huggingface.co/nvidia/Cosmos3-Super-Image2Video) | image → video, text → video (no audio branch) |
+| [`nvidia/Cosmos3-Super-Image2Video-4Step`](https://huggingface.co/nvidia/Cosmos3-Super-Image2Video-4Step) | image → video (DMD2-distilled, 4 steps, cfg 1) |
 
 The architecture is read from the checkpoint's `transformer/config.json`, so width, depth, base fps
 and the presence of the audio branch all follow the model you point the loader at.
@@ -106,6 +108,12 @@ audio output is unused. Super also ships no `assets/negative_prompt.json`, so
 `Cosmos3 Default Negative Prompt` yields an empty string on it — type a negative prompt directly
 into the negative Text Encode if you want one.
 
+**`cosmos3_super_i2v_4step.json` — Cosmos3-Super-Image2Video-4Step (distilled).** The DMD2-distilled
+4-step variant. Same graph as `cosmos3_super_i2v.json` but: `Cosmos3 Scheduler` set to
+`schedule = distilled_4step` (its fixed 4-step schedule, so `steps`/`flow_shift` are ignored), the
+sampler switched to **euler**, and `CFGGuider` cfg **1.0** (the model is guidance-distilled, so no
+CFG). fps stays 16. Four steps instead of 35.
+
 **For I2V + audio**, chain Text Encode → Image to Video → Empty AV Latent Video (use the AV node's
 latent; discard the I2V one), then sample as usual.
 
@@ -115,7 +123,7 @@ latent; discard the I2V one), then sample as usual.
 prompts work, and NVIDIA's JSON-upsampled prompts (cosmos-framework) can be pasted directly into
 the prompt field.
 
-Set `fps` to the checkpoint's `base_fps` — **24 for Cosmos3-Nano, 16 for Cosmos3-Super** — in Text
+Set `fps` to the checkpoint's `base_fps` — **24 for Cosmos3-Nano and Cosmos3-Super, 16 for both Cosmos3-Super-Image2Video variants (incl. -4Step)** — in Text
 Encode, the AV latent node and `CreateVideo`. It feeds the duration metadata sentence and the
 temporal position ids, so a mismatch shows up as wrong pacing. At 24 fps, 189 frames is 7.9 s.
 
@@ -132,8 +140,8 @@ to fit.
 ## Limitations
 
 - **Audio input** conditioning is unsupported — the checkpoints ship only the AVAE decoder.
-- The three audio nodes need a checkpoint with a `sound_tokenizer`. Cosmos3-Super is video-only,
-  so on it the loader's audio output is empty and those nodes do not apply.
+- The three audio nodes need a checkpoint with a `sound_tokenizer`. Cosmos3-Super-Image2Video is
+  video-only, so on it the loader's audio output is empty and those nodes do not apply.
 - No action conditioning, reasoning/CoT, or super-resolution.
 
 ## Troubleshooting
