@@ -186,15 +186,37 @@ def load_cosmos3_model(
     shard_paths = _resolve_shard_files(transformer_dir)
     logger.info("Found %d transformer shard(s)", len(shard_paths))
 
-    if weight_dtype == "fp8_e4m3fn":
+    # A checkpoint produced by convert_to_quant (ctq) already carries per-layer
+    # ".comfy_quant" markers; load it through mixed_precision_ops as-is rather than
+    # quantizing here. Detected by peeking the first shard's keys (header only).
+    from safetensors import safe_open
+    with safe_open(shard_paths[0], framework="pt", device="cpu") as _f:
+        prequant = any(k.endswith(".comfy_quant") for k in _f.keys())
+    if prequant:
+        logger.info("Detected pre-quantized checkpoint (comfy_quant markers present)")
+
+    if weight_dtype == "fp8_e4m3fn" and not prequant:
         unet_dtype = torch.float8_e4m3fn
         manual_cast_dtype = torch.bfloat16
     else:
+        # bf16 for the default path and for int8/pre-quantized: quantized weights
+        # live inside the mixed_precision_ops Linear layers; compute stays bf16.
         unet_dtype = torch.bfloat16
         manual_cast_dtype = None
 
     model_config = Cosmos3ModelConfig(unet_config)
     model_config.set_inference_dtype(unet_dtype, manual_cast_dtype)
+
+    if weight_dtype == "int8" or prequant:
+        # Route every ops.Linear through ComfyUI's native mixed-precision int8 ops.
+        # BaseModel uses model_config.custom_operations when set (model_base.py),
+        # bypassing pick_operations, so this is the whole wiring on the build side.
+        # weight_dtype="int8" quantizes below; a pre-quantized checkpoint loads as-is.
+        quant_config = {"mixed_ops": True}
+        model_config.quant_config = quant_config
+        model_config.custom_operations = comfy.ops.mixed_precision_ops(
+            quant_config, torch.bfloat16
+        )
 
     offload_device = comfy.model_management.unet_offload_device()
     load_device = comfy.model_management.get_torch_device()
@@ -210,6 +232,25 @@ def load_cosmos3_model(
     unexpected_all = []
     fp8_count = 0
 
+    # int8: the mixed-precision Linear defers weight creation until load, so its
+    # weight keys are absent from state_dict() here — add them to `expected` and
+    # gather the set we quantize (only these; norms/embeddings/biases stay bf16).
+    int8_count = 0
+    linear_weight_keys = set()
+    if weight_dtype == "int8" or prequant:
+        linear_weight_keys = {
+            name + ".weight"
+            for name, m in target.named_modules()
+            if isinstance(m, model_config.custom_operations.Linear)
+        }
+        expected |= linear_weight_keys
+
+    # int8 accumulates the full quantized state dict and loads once after the loop:
+    # comfy's _load_quantized_module sets weight=None for any layer absent from the
+    # dict it is handed, so a per-shard load would wipe weights carried by earlier
+    # shards. int8 weights are ~half of bf16, so accumulating them is cheap.
+    quant_sd = {} if (weight_dtype == "int8" or prequant) else None
+
     for shard_path in shard_paths:
         logger.info("  Loading %s", os.path.basename(shard_path))
         shard = comfy.utils.load_torch_file(shard_path, safe_load=True)
@@ -221,6 +262,30 @@ def load_cosmos3_model(
                 if not _should_skip_fp8(k, t):
                     shard[k] = t.to(torch.float8_e4m3fn)
                     fp8_count += 1
+        elif weight_dtype == "int8" or prequant:
+            # Pre-quantized: keys already carry int8 weight + weight_scale + comfy_quant,
+            # so just accumulate them. weight_dtype="int8": quantize each Linear weight
+            # to per-output-channel (per-row) symmetric int8 — the granularity comfy's
+            # int8_tensorwise format expects (weight_scale is [out_features, 1]).
+            # Per-row is essential: Cosmos3 weights have large per-channel outliers
+            # (ratio 20-120x) that a single per-tensor scale destroys.
+            for k, t in shard.items():
+                if (not prequant) and k in linear_weight_keys and t.ndim == 2:
+                    w = t.to(load_device, dtype=torch.float32)
+                    scale = w.abs().amax(dim=1, keepdim=True).clamp(min=1e-30) / 127.0
+                    qw = (w / scale).round().clamp(-128, 127).to(torch.int8)
+                    base = k[: -len(".weight")]
+                    quant_sd[k] = qw.to("cpu")
+                    quant_sd[base + ".weight_scale"] = scale.to("cpu")
+                    quant_sd[base + ".comfy_quant"] = torch.tensor(
+                        list(json.dumps({"format": "int8_tensorwise"}).encode("utf-8")),
+                        dtype=torch.uint8,
+                    )
+                    int8_count += 1
+                else:
+                    quant_sd[k] = t
+            del shard
+            continue
 
         shard = model_config.process_unet_state_dict(shard)
         _, unexpected = target.load_state_dict(shard, strict=False)
@@ -228,8 +293,17 @@ def load_cosmos3_model(
         unexpected_all.extend(unexpected)
         del shard
 
+    if weight_dtype == "int8" or prequant:
+        quant_sd = model_config.process_unet_state_dict(quant_sd)
+        _, unexpected = target.load_state_dict(quant_sd, strict=False)
+        loaded.update(k for k in quant_sd if k in expected)
+        unexpected_all.extend(unexpected)
+        del quant_sd
+
     if weight_dtype == "fp8_e4m3fn":
         logger.info("Cast %d weights to fp8_e4m3fn", fp8_count)
+    elif weight_dtype == "int8":
+        logger.info("Quantized %d linear weights to int8_tensorwise", int8_count)
 
     missing = sorted(expected - loaded)
     if missing:
