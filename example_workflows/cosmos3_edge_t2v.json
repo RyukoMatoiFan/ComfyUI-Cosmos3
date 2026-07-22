@@ -1,0 +1,679 @@
+{
+  "last_node_id": 13,
+  "last_link_id": 16,
+  "nodes": [
+    {
+      "id": 1,
+      "type": "Cosmos3Loader",
+      "pos": [
+        0,
+        0
+      ],
+      "size": [
+        350,
+        80
+      ],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "MODEL",
+          "type": "MODEL",
+          "slot_index": 0,
+          "links": [
+            1
+          ]
+        },
+        {
+          "name": "COSMOS3_TEXT_ENCODER",
+          "type": "COSMOS3_TEXT_ENCODER",
+          "slot_index": 1,
+          "links": [
+            2,
+            4,
+            5
+          ]
+        },
+        {
+          "name": "VAE",
+          "type": "VAE",
+          "slot_index": 2,
+          "links": [
+            3
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "Cosmos3Loader"
+      },
+      "widgets_values": [
+        "Cosmos3-Edge",
+        "default"
+      ]
+    },
+    {
+      "id": 2,
+      "type": "Cosmos3TextEncode",
+      "title": "Positive Prompt",
+      "pos": [
+        400,
+        -120
+      ],
+      "size": [
+        500,
+        260
+      ],
+      "flags": {},
+      "order": 1,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "text_encoder",
+          "type": "COSMOS3_TEXT_ENCODER",
+          "link": 2
+        }
+      ],
+      "outputs": [
+        {
+          "name": "CONDITIONING",
+          "type": "CONDITIONING",
+          "slot_index": 0,
+          "links": [
+            7
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "Cosmos3TextEncode"
+      },
+      "widgets_values": [
+        "A robotic arm picks up a ceramic plate from a kitchen sink and wipes it with a yellow sponge, water droplets glistening.",
+        832,
+        480,
+        93,
+        24.0,
+        true,
+        true
+      ]
+    },
+    {
+      "id": 3,
+      "type": "Cosmos3DefaultNegativePrompt",
+      "pos": [
+        400,
+        180
+      ],
+      "size": [
+        320,
+        46
+      ],
+      "flags": {},
+      "order": 2,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "text_encoder",
+          "type": "COSMOS3_TEXT_ENCODER",
+          "link": 4
+        }
+      ],
+      "outputs": [
+        {
+          "name": "negative_prompt",
+          "type": "STRING",
+          "slot_index": 0,
+          "links": [
+            6
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "Cosmos3DefaultNegativePrompt"
+      },
+      "widgets_values": []
+    },
+    {
+      "id": 4,
+      "type": "Cosmos3TextEncode",
+      "title": "Negative Prompt",
+      "pos": [
+        400,
+        240
+      ],
+      "size": [
+        500,
+        260
+      ],
+      "flags": {},
+      "order": 3,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "text_encoder",
+          "type": "COSMOS3_TEXT_ENCODER",
+          "link": 5
+        },
+        {
+          "name": "prompt",
+          "type": "STRING",
+          "link": 6,
+          "widget": {
+            "name": "prompt"
+          }
+        }
+      ],
+      "outputs": [
+        {
+          "name": "CONDITIONING",
+          "type": "CONDITIONING",
+          "slot_index": 0,
+          "links": [
+            8
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "Cosmos3TextEncode"
+      },
+      "widgets_values": [
+        "",
+        832,
+        480,
+        93,
+        24.0,
+        true,
+        true
+      ]
+    },
+    {
+      "id": 5,
+      "type": "Cosmos3EmptyLatentVideo",
+      "pos": [
+        400,
+        560
+      ],
+      "size": [
+        300,
+        130
+      ],
+      "flags": {},
+      "order": 4,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "LATENT",
+          "type": "LATENT",
+          "slot_index": 0,
+          "links": [
+            9
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "Cosmos3EmptyLatentVideo"
+      },
+      "widgets_values": [
+        832,
+        480,
+        93,
+        1
+      ]
+    },
+    {
+      "id": 6,
+      "type": "CFGGuider",
+      "pos": [
+        960,
+        80
+      ],
+      "size": [
+        270,
+        100
+      ],
+      "flags": {},
+      "order": 5,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "model",
+          "type": "MODEL",
+          "link": 1
+        },
+        {
+          "name": "positive",
+          "type": "CONDITIONING",
+          "link": 7
+        },
+        {
+          "name": "negative",
+          "type": "CONDITIONING",
+          "link": 8
+        }
+      ],
+      "outputs": [
+        {
+          "name": "GUIDER",
+          "type": "GUIDER",
+          "slot_index": 0,
+          "links": [
+            10
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "CFGGuider"
+      },
+      "widgets_values": [
+        6.0
+      ]
+    },
+    {
+      "id": 7,
+      "type": "RandomNoise",
+      "pos": [
+        960,
+        220
+      ],
+      "size": [
+        270,
+        82
+      ],
+      "flags": {},
+      "order": 6,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "NOISE",
+          "type": "NOISE",
+          "slot_index": 0,
+          "links": [
+            11
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "RandomNoise"
+      },
+      "widgets_values": [
+        123,
+        "fixed"
+      ]
+    },
+    {
+      "id": 8,
+      "type": "KSamplerSelect",
+      "pos": [
+        960,
+        340
+      ],
+      "size": [
+        270,
+        58
+      ],
+      "flags": {},
+      "order": 7,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "SAMPLER",
+          "type": "SAMPLER",
+          "slot_index": 0,
+          "links": [
+            12
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "KSamplerSelect"
+      },
+      "widgets_values": [
+        "uni_pc_bh2"
+      ]
+    },
+    {
+      "id": 9,
+      "type": "Cosmos3Scheduler",
+      "pos": [
+        960,
+        430
+      ],
+      "size": [
+        300,
+        130
+      ],
+      "flags": {},
+      "order": 8,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "SIGMAS",
+          "type": "SIGMAS",
+          "slot_index": 0,
+          "links": [
+            13
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "Cosmos3Scheduler"
+      },
+      "widgets_values": [
+        35,
+        5.0,
+        1.0
+      ]
+    },
+    {
+      "id": 10,
+      "type": "SamplerCustomAdvanced",
+      "pos": [
+        1320,
+        200
+      ],
+      "size": [
+        280,
+        130
+      ],
+      "flags": {},
+      "order": 9,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "noise",
+          "type": "NOISE",
+          "link": 11
+        },
+        {
+          "name": "guider",
+          "type": "GUIDER",
+          "link": 10
+        },
+        {
+          "name": "sampler",
+          "type": "SAMPLER",
+          "link": 12
+        },
+        {
+          "name": "sigmas",
+          "type": "SIGMAS",
+          "link": 13
+        },
+        {
+          "name": "latent_image",
+          "type": "LATENT",
+          "link": 9
+        }
+      ],
+      "outputs": [
+        {
+          "name": "output",
+          "type": "LATENT",
+          "slot_index": 0,
+          "links": [
+            14
+          ]
+        },
+        {
+          "name": "denoised_output",
+          "type": "LATENT",
+          "slot_index": 1,
+          "links": null
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "SamplerCustomAdvanced"
+      },
+      "widgets_values": []
+    },
+    {
+      "id": 11,
+      "type": "VAEDecode",
+      "pos": [
+        1660,
+        200
+      ],
+      "size": [
+        210,
+        46
+      ],
+      "flags": {},
+      "order": 10,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "samples",
+          "type": "LATENT",
+          "link": 14
+        },
+        {
+          "name": "vae",
+          "type": "VAE",
+          "link": 3
+        }
+      ],
+      "outputs": [
+        {
+          "name": "IMAGE",
+          "type": "IMAGE",
+          "slot_index": 0,
+          "links": [
+            15
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "VAEDecode"
+      },
+      "widgets_values": []
+    },
+    {
+      "id": 12,
+      "type": "CreateVideo",
+      "pos": [
+        1920,
+        200
+      ],
+      "size": [
+        210,
+        78
+      ],
+      "flags": {},
+      "order": 11,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "images",
+          "type": "IMAGE",
+          "link": 15
+        }
+      ],
+      "outputs": [
+        {
+          "name": "VIDEO",
+          "type": "VIDEO",
+          "slot_index": 0,
+          "links": [
+            16
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "CreateVideo"
+      },
+      "widgets_values": [
+        24.0
+      ]
+    },
+    {
+      "id": 13,
+      "type": "SaveVideo",
+      "pos": [
+        2180,
+        200
+      ],
+      "size": [
+        300,
+        130
+      ],
+      "flags": {},
+      "order": 12,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "video",
+          "type": "VIDEO",
+          "link": 16
+        }
+      ],
+      "outputs": [],
+      "properties": {
+        "Node name for S&R": "SaveVideo"
+      },
+      "widgets_values": [
+        "video/ComfyUI",
+        "auto",
+        "auto"
+      ]
+    }
+  ],
+  "links": [
+    [
+      1,
+      1,
+      0,
+      6,
+      0,
+      "MODEL"
+    ],
+    [
+      2,
+      1,
+      1,
+      2,
+      0,
+      "COSMOS3_TEXT_ENCODER"
+    ],
+    [
+      3,
+      1,
+      2,
+      11,
+      1,
+      "VAE"
+    ],
+    [
+      4,
+      1,
+      1,
+      3,
+      0,
+      "COSMOS3_TEXT_ENCODER"
+    ],
+    [
+      5,
+      1,
+      1,
+      4,
+      0,
+      "COSMOS3_TEXT_ENCODER"
+    ],
+    [
+      6,
+      3,
+      0,
+      4,
+      1,
+      "STRING"
+    ],
+    [
+      7,
+      2,
+      0,
+      6,
+      1,
+      "CONDITIONING"
+    ],
+    [
+      8,
+      4,
+      0,
+      6,
+      2,
+      "CONDITIONING"
+    ],
+    [
+      9,
+      5,
+      0,
+      10,
+      4,
+      "LATENT"
+    ],
+    [
+      10,
+      6,
+      0,
+      10,
+      1,
+      "GUIDER"
+    ],
+    [
+      11,
+      7,
+      0,
+      10,
+      0,
+      "NOISE"
+    ],
+    [
+      12,
+      8,
+      0,
+      10,
+      2,
+      "SAMPLER"
+    ],
+    [
+      13,
+      9,
+      0,
+      10,
+      3,
+      "SIGMAS"
+    ],
+    [
+      14,
+      10,
+      0,
+      11,
+      0,
+      "LATENT"
+    ],
+    [
+      15,
+      11,
+      0,
+      12,
+      0,
+      "IMAGE"
+    ],
+    [
+      16,
+      12,
+      0,
+      13,
+      0,
+      "VIDEO"
+    ]
+  ],
+  "groups": [],
+  "config": {},
+  "extra": {},
+  "version": 0.4
+}

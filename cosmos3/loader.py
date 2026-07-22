@@ -95,11 +95,15 @@ _CONFIG_PASSTHROUGH = (
     "latent_channel", "latent_patch_size", "vocab_size", "rope_theta",
     "rope_scaling", "base_fps", "enable_fps_modulation", "timestep_scale",
     "rms_norm_eps", "patch_latent_dim", "sound_gen", "sound_dim",
+    # Edge (nemotron_dense) backbone flags
+    "hidden_act", "qk_norm_for_text", "use_und_k_norm_for_gen",
 )
 
 # Keys whose checkpoint name differs from the constructor parameter name.
 _CONFIG_KEY_ALIASES = {
     "unified_3d_mrope_temporal_modality_margin": "mrope_margin",
+    # Edge names the mRoPE section axes rope_axes_dim; Nano/Super use rope_scaling.mrope_section.
+    "rope_axes_dim": "mrope_section",
 }
 
 

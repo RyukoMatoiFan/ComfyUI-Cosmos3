@@ -51,6 +51,10 @@ class Cosmos3TextEncoderWrapper:
             self.tokenizer = tokenizer
         else:
             tokenizer_path = os.path.join(model_dir, "text_tokenizer")
+            if not os.path.isdir(tokenizer_path):
+                # Edge ships its (Nemotron) tokenizer at the checkpoint root rather
+                # than in a text_tokenizer/ subfolder.
+                tokenizer_path = model_dir
             self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
 
         # Resolve special token IDs

@@ -42,6 +42,31 @@ def _rotate_half(x: torch.Tensor) -> torch.Tensor:
     return torch.cat((-x[..., half:], x[..., :half]), dim=-1)
 
 
+class Cosmos3NemotronRMSNorm(nn.Module):
+    """RMSNorm used by the Edge (nemotron_dense) backbone. Always normalizes in fp32
+    then casts back — distinct from the standard RMSNorm used by Nano/Super. Plain
+    weight Parameter (checkpoint stores <name>.weight), no comfy ops wrapper."""
+
+    def __init__(self, dim: int, eps: float, device=None, dtype=None):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim, device=device, dtype=dtype))
+
+    def forward(self, hidden_states):
+        input_dtype = hidden_states.dtype
+        hidden_states = hidden_states.float()
+        variance = hidden_states.pow(2).mean(-1, keepdim=True)
+        hidden_states = hidden_states * torch.rsqrt(variance + self.eps)
+        return (self.weight.float() * hidden_states).to(input_dtype)
+
+
+def _rmsnorm(nemotron: bool, dim: int, eps: float, operations, device, dtype):
+    """RMSNorm factory: Nemotron variant for the relu2/Edge backbone, else comfy ops."""
+    if nemotron:
+        return Cosmos3NemotronRMSNorm(dim, eps, device=device, dtype=dtype)
+    return operations.RMSNorm(dim, eps=eps, elementwise_affine=True, device=device, dtype=dtype)
+
+
 class Cosmos3RotaryEmbedding(nn.Module):
     """
     Cosmos3VLTextRotaryEmbedding — interleaved 3D mRoPE.
@@ -184,19 +209,29 @@ def _get_mrope_ids_sound(T_s: int,
 # ---------------------------------------------------------------------------
 
 class Cosmos3MLP(nn.Module):
-    def __init__(self, hidden_size: int, intermediate_size: int,
+    """Gated SwiGLU MLP (Nano/Super) or non-gated squared-ReLU MLP (Edge).
+
+    gated=True  -> down(silu(gate(x)) * up(x))          (hidden_act "silu")
+    gated=False -> down(relu(up(x))**2)                 (hidden_act "relu2", no gate_proj)
+    """
+
+    def __init__(self, hidden_size: int, intermediate_size: int, gated: bool = True,
                  device=None, dtype=None, operations=None):
         super().__init__()
         ops = operations
-        self.gate_proj = ops.Linear(hidden_size, intermediate_size, bias=False,
-                                    device=device, dtype=dtype)
+        self.gated = gated
+        if gated:
+            self.gate_proj = ops.Linear(hidden_size, intermediate_size, bias=False,
+                                        device=device, dtype=dtype)
         self.up_proj   = ops.Linear(hidden_size, intermediate_size, bias=False,
                                     device=device, dtype=dtype)
         self.down_proj = ops.Linear(intermediate_size, hidden_size, bias=False,
                                     device=device, dtype=dtype)
 
     def forward(self, x):
-        return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
+        if self.gated:
+            return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
+        return self.down_proj(torch.relu(self.up_proj(x)).square())
 
 
 # ---------------------------------------------------------------------------
@@ -214,6 +249,9 @@ class Cosmos3PackedMoTAttention(nn.Module):
     def __init__(self, hidden_size: int, head_dim: int,
                  num_attention_heads: int, num_key_value_heads: int,
                  rms_norm_eps: float,
+                 qk_norm_for_text: bool = True,
+                 use_und_k_norm_for_gen: bool = False,
+                 nemotron_norm: bool = False,
                  device=None, dtype=None, operations=None):
         super().__init__()
         ops = operations
@@ -230,10 +268,19 @@ class Cosmos3PackedMoTAttention(nn.Module):
                                   device=device, dtype=dtype)
         self.to_out = ops.Linear(num_attention_heads * head_dim, hidden_size, bias=False,
                                   device=device, dtype=dtype)
-        self.norm_q = ops.RMSNorm(head_dim, eps=rms_norm_eps,
-                                   elementwise_affine=True, device=device, dtype=dtype)
-        self.norm_k = ops.RMSNorm(head_dim, eps=rms_norm_eps,
-                                   elementwise_affine=True, device=device, dtype=dtype)
+        # Nano/Super norm the und q/k (qk_norm_for_text). Edge sets this False (Identity,
+        # no norm_q/norm_k keys) and instead norms the und K only when it is replayed in
+        # the gen pathway, via a separate k_norm_und_for_gen (use_und_k_norm_for_gen).
+        if qk_norm_for_text:
+            self.norm_q = _rmsnorm(nemotron_norm, head_dim, rms_norm_eps, ops, device, dtype)
+            self.norm_k = _rmsnorm(nemotron_norm, head_dim, rms_norm_eps, ops, device, dtype)
+        else:
+            self.norm_q = nn.Identity()
+            self.norm_k = nn.Identity()
+        if use_und_k_norm_for_gen:
+            self.k_norm_und_for_gen = _rmsnorm(nemotron_norm, head_dim, rms_norm_eps, ops, device, dtype)
+        else:
+            self.k_norm_und_for_gen = None
 
         # Generation pathway
         self.add_q_proj  = ops.Linear(hidden_size, num_attention_heads * head_dim, bias=False,
@@ -244,10 +291,8 @@ class Cosmos3PackedMoTAttention(nn.Module):
                                        device=device, dtype=dtype)
         self.to_add_out  = ops.Linear(num_attention_heads * head_dim, hidden_size, bias=False,
                                        device=device, dtype=dtype)
-        self.norm_added_q = ops.RMSNorm(head_dim, eps=rms_norm_eps,
-                                         elementwise_affine=True, device=device, dtype=dtype)
-        self.norm_added_k = ops.RMSNorm(head_dim, eps=rms_norm_eps,
-                                         elementwise_affine=True, device=device, dtype=dtype)
+        self.norm_added_q = _rmsnorm(nemotron_norm, head_dim, rms_norm_eps, ops, device, dtype)
+        self.norm_added_k = _rmsnorm(nemotron_norm, head_dim, rms_norm_eps, ops, device, dtype)
 
     def forward_und(self, und_seq, cos_und, sin_und):
         """
@@ -266,7 +311,8 @@ class Cosmos3PackedMoTAttention(nn.Module):
         n_rep = H_q // H_kv
 
         q_und = self.norm_q(self.to_q(und_seq).view(-1, H_q, d))
-        k_und = self.norm_k(self.to_k(und_seq).view(-1, H_kv, d))
+        k_raw = self.to_k(und_seq).view(-1, H_kv, d)
+        k_und = self.norm_k(k_raw)
         v_und = self.to_v(und_seq).view(-1, H_kv, d)
 
         cos_ = cos_und.unsqueeze(1)  # [L_t, 1, head_dim]
@@ -286,7 +332,15 @@ class Cosmos3PackedMoTAttention(nn.Module):
         )
         causal_out = causal_out_4d.permute(0, 2, 1, 3).reshape(L_t, H_q * d)
 
-        return self.to_out(causal_out), k_und, v_und
+        # K cached for the gen pathway: Edge re-norms the raw und K with a dedicated
+        # k_norm_und_for_gen (before RoPE); Nano/Super reuse the und-path K unchanged.
+        if self.k_norm_und_for_gen is not None:
+            k_gen = self.k_norm_und_for_gen(k_raw)
+            k_gen = k_gen * cos_ + _rotate_half(k_gen) * sin_
+        else:
+            k_gen = k_und
+
+        return self.to_out(causal_out), k_gen, v_und
 
     def forward_gen(self, gen_seq, k_und, v_und, cos_gen, sin_gen):
         """
@@ -336,6 +390,8 @@ class Cosmos3DecoderLayer(nn.Module):
     def __init__(self, hidden_size: int, head_dim: int,
                  num_attention_heads: int, num_key_value_heads: int,
                  intermediate_size: int, rms_norm_eps: float,
+                 gated_mlp: bool = True, qk_norm_for_text: bool = True,
+                 use_und_k_norm_for_gen: bool = False, nemotron_norm: bool = False,
                  device=None, dtype=None, operations=None):
         super().__init__()
         ops = operations
@@ -345,27 +401,22 @@ class Cosmos3DecoderLayer(nn.Module):
             num_attention_heads=num_attention_heads,
             num_key_value_heads=num_key_value_heads,
             rms_norm_eps=rms_norm_eps,
+            qk_norm_for_text=qk_norm_for_text,
+            use_und_k_norm_for_gen=use_und_k_norm_for_gen,
+            nemotron_norm=nemotron_norm,
             device=device, dtype=dtype, operations=ops,
         )
         # Understanding MLP
-        self.mlp = Cosmos3MLP(hidden_size, intermediate_size,
+        self.mlp = Cosmos3MLP(hidden_size, intermediate_size, gated=gated_mlp,
                                device=device, dtype=dtype, operations=ops)
         # Generation MLP
-        self.mlp_moe_gen = Cosmos3MLP(hidden_size, intermediate_size,
+        self.mlp_moe_gen = Cosmos3MLP(hidden_size, intermediate_size, gated=gated_mlp,
                                        device=device, dtype=dtype, operations=ops)
 
-        self.input_layernorm = ops.RMSNorm(
-            hidden_size, eps=rms_norm_eps, elementwise_affine=True,
-            device=device, dtype=dtype)
-        self.input_layernorm_moe_gen = ops.RMSNorm(
-            hidden_size, eps=rms_norm_eps, elementwise_affine=True,
-            device=device, dtype=dtype)
-        self.post_attention_layernorm = ops.RMSNorm(
-            hidden_size, eps=rms_norm_eps, elementwise_affine=True,
-            device=device, dtype=dtype)
-        self.post_attention_layernorm_moe_gen = ops.RMSNorm(
-            hidden_size, eps=rms_norm_eps, elementwise_affine=True,
-            device=device, dtype=dtype)
+        self.input_layernorm = _rmsnorm(nemotron_norm, hidden_size, rms_norm_eps, ops, device, dtype)
+        self.input_layernorm_moe_gen = _rmsnorm(nemotron_norm, hidden_size, rms_norm_eps, ops, device, dtype)
+        self.post_attention_layernorm = _rmsnorm(nemotron_norm, hidden_size, rms_norm_eps, ops, device, dtype)
+        self.post_attention_layernorm_moe_gen = _rmsnorm(nemotron_norm, hidden_size, rms_norm_eps, ops, device, dtype)
 
     def forward_und(self, und_seq, cos_und, sin_und):
         """Prefill the und pathway. Returns (und_seq_next, k_und, v_und)."""
@@ -457,6 +508,10 @@ class Cosmos3OmniTransformer(nn.Module):
         patch_latent_dim: int = 192,
         sound_gen: bool = True,
         sound_dim: int = 64,
+        # Edge (nemotron_dense) backbone flags — defaults keep Nano/Super behaviour.
+        hidden_act: str = None,
+        qk_norm_for_text: bool = True,
+        use_und_k_norm_for_gen: bool = False,
         **kwargs,
     ):
         super().__init__()
@@ -491,6 +546,11 @@ class Cosmos3OmniTransformer(nn.Module):
         self.embed_tokens = ops.Embedding(vocab_size, hidden_size,
                                            device=device, dtype=dtype)
 
+        # Edge (nemotron_dense) uses a non-gated squared-ReLU MLP, no text qk-norm, and
+        # the Nemotron RMSNorm variant for every norm — all keyed off hidden_act=relu2.
+        gated_mlp = (hidden_act or "silu") != "relu2"
+        nemotron_norm = (hidden_act == "relu2")
+
         # Transformer layers
         self.layers = nn.ModuleList([
             Cosmos3DecoderLayer(
@@ -500,16 +560,18 @@ class Cosmos3OmniTransformer(nn.Module):
                 num_key_value_heads=num_key_value_heads,
                 intermediate_size=intermediate_size,
                 rms_norm_eps=rms_norm_eps,
+                gated_mlp=gated_mlp,
+                qk_norm_for_text=qk_norm_for_text,
+                use_und_k_norm_for_gen=use_und_k_norm_for_gen,
+                nemotron_norm=nemotron_norm,
                 device=device, dtype=dtype, operations=ops,
             )
             for _ in range(num_hidden_layers)
         ])
 
         # Final norms
-        self.norm         = ops.RMSNorm(hidden_size, eps=rms_norm_eps,
-                                         elementwise_affine=True, device=device, dtype=dtype)
-        self.norm_moe_gen = ops.RMSNorm(hidden_size, eps=rms_norm_eps,
-                                         elementwise_affine=True, device=device, dtype=dtype)
+        self.norm         = _rmsnorm(nemotron_norm, hidden_size, rms_norm_eps, ops, device, dtype)
+        self.norm_moe_gen = _rmsnorm(nemotron_norm, hidden_size, rms_norm_eps, ops, device, dtype)
 
         # Rotary embedding (no learnable weights)
         self.rotary_emb = Cosmos3RotaryEmbedding(
