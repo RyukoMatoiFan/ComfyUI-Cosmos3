@@ -24,7 +24,7 @@ and the presence of the audio branch all follow the model you point the loader a
   KSampler / SamplerCustomAdvanced stack.
 - Hooks into ComfyUI's dynamic VRAM, so the model streams from system RAM rather than
   needing to be resident in VRAM — see [VRAM](#vram).
-- `fp8_e4m3fn` weights as a smaller, faster alternative to the default bf16.
+- `fp8_e4m3fn` weights as a smaller alternative to the default bf16 (less data to stream).
 - Flow-matching UniPC schedule (shifted, `uni_pc_bh2`).
 - The text ("und") tower is prefilled once per prompt and its per-layer K/V reused across
   denoising steps.
@@ -58,7 +58,7 @@ recommended there.
 
 | Node | Purpose · key inputs → outputs |
 |------|--------------------------------|
-| **Cosmos3 Loader** | Load the model. `weight_dtype` = `default` (bf16) or `fp8_e4m3fn` (smaller, faster). → `MODEL`, `COSMOS3_TEXT_ENCODER`, `VAE`, `COSMOS3_AUDIO_VAE` (empty on checkpoints without audio) |
+| **Cosmos3 Loader** | Load the model. `weight_dtype` = `default` (bf16), `fp8_e4m3fn`, or `int8` (on-the-fly ComfyUI-native int8). Pre-quantized ConvRot checkpoints (see [Quantized weights](#quantized-weights)) are auto-detected from their metadata — load those with `default`. → `MODEL`, `COSMOS3_TEXT_ENCODER`, `VAE`, `COSMOS3_AUDIO_VAE` (empty on checkpoints without audio) |
 | **Cosmos3 Text Encode** | Tokenize a prompt (chat template + optional resolution/duration metadata). Set `width`/`height`/`num_frames`/`fps` to match the latent. → `CONDITIONING` |
 | **Cosmos3 Default Negative Prompt** | Returns the checkpoint's bundled `assets/negative_prompt.json` as a STRING — wire into a negative Text Encode. Returns an empty string when the checkpoint ships no such file. → `STRING` |
 | **Cosmos3 Empty Latent Video** | Zero latent `[B, 48, (length-1)//4+1, H/16, W/16]`. → `LATENT` |
@@ -80,7 +80,8 @@ The frame-count widgets accept up to **401** frames.
 
 Drag a JSON onto the canvas. All four share the same sampling setup — 832×480, 35 steps, cfg 6.0,
 `uni_pc_bh2`, `flow_shift` 5.0 (the 480p value), bf16 weights — so they differ only in what is
-being generated.
+being generated. They also work with the [quantized checkpoints](#quantized-weights): point the
+loader at a folder whose `transformer/` holds a ConvRot file and it loads from the metadata.
 
 **`cosmos3_t2v.json` — text to video.** The baseline graph: prompt → `Cosmos3 Text Encode`, an
 empty latent from `Cosmos3 Empty Latent Video`, sampled and decoded to 93 frames at 24 fps (3.9 s).
@@ -143,6 +144,26 @@ resolution, rather than checkpoint size, are what govern whether a given job fit
 Streaming moves weight data across the bus during sampling, so less available VRAM means more
 transfer per step. `fp8_e4m3fn` reduces how much has to be streamed, and is not required in order
 to fit.
+
+## Quantized weights
+
+Pre-quantized ConvRot transformers for the official `transformer/` are hosted at
+[`AkaneTendo25/Cosmos3-ConvRot`](https://huggingface.co/AkaneTendo25/Cosmos3-ConvRot).
+
+| Format | Status | What it is | Nano | Super |
+|--------|--------|------------|------|-------|
+| int8-ConvRot | available | weight-only int8, per-row scale + Hadamard rotation | ~16 GB | ~62 GB |
+| int4-ConvRot | not yet published | MLP int4 (GPTQ-calibrated) + attention int8 | ~9.5 GB | ~38 GB |
+
+Both are weight-only — activations stay bf16, so the effect is lower memory use, not faster
+inference. They are lossy relative to bf16; compare against the bf16 checkpoint for your use case.
+
+**To use:** download the `*.safetensors` for a model, put it in `<checkpoint>/transformer/` renamed to
+`diffusion_pytorch_model.safetensors` (remove the bf16 shards and `*.index.json`), and keep the
+official `vae/`, tokenizers and `config.json`. The loader reads the ConvRot format from the checkpoint
+metadata — load with `weight_dtype = default`; no workflow or node change is needed. Requires a
+ComfyUI build with native ConvRot support (comfy-kitchen; int8 from ≥ 0.27, int4 from the convrot-int4
+build).
 
 ## Limitations
 

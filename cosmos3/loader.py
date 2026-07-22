@@ -249,10 +249,9 @@ def load_cosmos3_model(
         }
         expected |= linear_weight_keys
 
-    # int8 accumulates the full quantized state dict and loads once after the loop:
-    # comfy's _load_quantized_module sets weight=None for any layer absent from the
-    # dict it is handed, so a per-shard load would wipe weights carried by earlier
-    # shards. int8 weights are ~half of bf16, so accumulating them is cheap.
+    # int8 / pre-quantized checkpoints accumulate the full quantized state dict and load it
+    # in a single call after the loop: comfy's _load_quantized_module sets weight=None for
+    # any layer absent from the dict it is handed.
     quant_sd = {} if (weight_dtype == "int8" or prequant) else None
 
     for shard_path in shard_paths:
