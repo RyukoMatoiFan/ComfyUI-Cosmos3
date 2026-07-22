@@ -63,9 +63,10 @@ class Cosmos3Loader:
                                "Accepts absolute path or a bare directory name resolvable "
                                "inside models/cosmos3/.",
                 }),
-                "weight_dtype": (["default", "fp8_e4m3fn"], {
+                "weight_dtype": (["default", "fp8_e4m3fn", "int8"], {
                     "tooltip": "default = bfloat16 (native). "
-                               "fp8_e4m3fn casts linear weights to fp8 to save VRAM.",
+                               "fp8_e4m3fn casts linear weights to fp8 to save VRAM. "
+                               "int8 uses ComfyUI native tensor-wise int8 (Triton kernels).",
                 }),
             }
         }
@@ -376,14 +377,29 @@ class Cosmos3Scheduler:
                     "default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01,
                     "tooltip": "Denoising strength (1.0 = full denoise).",
                 }),
-            }
+            },
+            "optional": {
+                "schedule": (["flow", "distilled_4step"], {
+                    "default": "flow",
+                    "tooltip": "flow = UniPC flow sigmas from steps/flow_shift. "
+                               "distilled_4step = the fixed 4-step DMD2 schedule for the "
+                               "Cosmos3-*-4Step checkpoints (ignores steps/flow_shift; "
+                               "pair with the euler sampler and cfg 1.0).",
+                }),
+            },
         }
 
     RETURN_TYPES = ("SIGMAS",)
     FUNCTION = "get_sigmas"
     CATEGORY = "Cosmos3"
 
-    def get_sigmas(self, steps: int, flow_shift: float, denoise: float):
+    # DMD2-distilled fixed 4-step schedule, taken from the 4Step checkpoints'
+    # scheduler/config.json (fixed_step_sampler_config.t_list) + the terminal 0.
+    _DISTILLED_4STEP = [1.0, 0.9375, 0.8333333333333334, 0.625, 0.0]
+
+    def get_sigmas(self, steps: int, flow_shift: float, denoise: float, schedule: str = "flow"):
+        if schedule == "distilled_4step":
+            return (torch.tensor(self._DISTILLED_4STEP, dtype=torch.float32),)
         compute_sigmas = _get_compute_sigmas()
         sigmas = compute_sigmas(steps=steps, flow_shift=flow_shift, denoise=denoise)
         return (sigmas,)
