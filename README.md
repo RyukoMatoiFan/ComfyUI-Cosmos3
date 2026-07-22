@@ -13,6 +13,7 @@ Supported checkpoints:
 | [`nvidia/Cosmos3-Super`](https://huggingface.co/nvidia/Cosmos3-Super) | text → video, image → video, joint audio-video |
 | [`nvidia/Cosmos3-Super-Image2Video`](https://huggingface.co/nvidia/Cosmos3-Super-Image2Video) | image → video, text → video (no audio branch) |
 | [`nvidia/Cosmos3-Super-Image2Video-4Step`](https://huggingface.co/nvidia/Cosmos3-Super-Image2Video-4Step) | image → video (DMD2-distilled, 4 steps, cfg 1) |
+| [`nvidia/Cosmos3-Edge`](https://huggingface.co/nvidia/Cosmos3-Edge) | text → video, image → video (compact Nemotron-dense backbone) |
 
 The architecture is read from the checkpoint's `transformer/config.json`, so width, depth, base fps
 and the presence of the audio branch all follow the model you point the loader at.
@@ -113,6 +114,12 @@ into the negative Text Encode if you want one.
 `schedule = distilled_4step` (its fixed 4-step schedule, so `steps`/`flow_shift` are ignored), the
 sampler switched to **euler**, and `CFGGuider` cfg **1.0** (the model is guidance-distilled, so no
 CFG). fps stays 16. Four steps instead of 35.
+
+**`cosmos3_edge_t2v.json` — Cosmos3-Edge text to video.** The compact, high-throughput variant.
+Same graph as `cosmos3_t2v.json` (fps 24) pointed at `Cosmos3-Edge`. Edge is a different backbone
+(`cosmos3_edge_nemotron_dense`: squared-ReLU non-gated MLP, no text QK-norm, its own Nemotron
+tokenizer) — the loader picks all of this up from `transformer/config.json`, so no extra setup is
+needed. Small and fast, with correspondingly lower fidelity than Nano/Super.
 
 **For I2V + audio**, chain Text Encode → Image to Video → Empty AV Latent Video (use the AV node's
 latent; discard the I2V one), then sample as usual.
