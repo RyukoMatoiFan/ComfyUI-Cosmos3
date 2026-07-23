@@ -177,27 +177,27 @@ decode at the step count shown.
 
 | Model | Format | RAM | Min VRAM | Time |
 |-------|--------|-----|----------|------|
-| Edge — t2v, 35 steps | bf16 | 14 GB | **~6 GB** | 18 s |
+| Edge — t2v, 35 steps | bf16 | 14 GB | **≈6 GB** | 18 s |
 | | int8 | 7 GB | | 25 s |
 | | int4 | 7 GB | | 17 s |
-| Nano — t2v, 35 steps | bf16 | 58 GB | **~7 GB** | 47 s |
+| Nano — t2v, 35 steps | bf16 | 58 GB | **≈7 GB** | 47 s |
 | | int8 | 21 GB | | 50 s |
 | | int4 | 20 GB | | 49 s |
-| Super — t2v, 35 steps | bf16 | 240 GB | **~8 GB** | 168 s |
+| Super — t2v, 35 steps | bf16 | 240 GB | **≈8 GB** | 168 s |
 | | int8 | 67 GB | | 174 s |
 | | int4 | 63 GB | | 168 s |
-| Super-Image2Video — i2v, 35 steps | bf16 | 240 GB | **~9 GB** | 167 s |
+| Super-Image2Video — i2v, 35 steps | bf16 | 240 GB | **≈9 GB** | 167 s |
 | | int8 | 67 GB | | 168 s |
 | | int4 | 63 GB | | 165 s |
-| Super-Image2Video-4Step — i2v, 4 steps | bf16 | 240 GB | **~9 GB** | 42 s |
+| Super-Image2Video-4Step — i2v, 4 steps | bf16 | 240 GB | **≈9 GB** | 42 s |
 | | int8 | 67 GB | | 20 s |
 | | int4 | 63 GB | | 16 s |
 
 RAM and VRAM trade off: these are at the minimum VRAM (maximum streaming); giving the GPU more VRAM
 holds more weights on-card, which lowers the RAM figure and speeds sampling. bf16 host RAM peaks near
 twice the weight size (staging), so the Super family is impractical in bf16 without a very large host.
-For that family the int4 checkpoints fit a **64 GB** host (~63 GB), while int8 needs a little more
-(~67 GB); Nano and Edge fit comfortably in any format.
+For that family the int4 checkpoints fit a **64 GB** host (≈63 GB), while int8 needs a little more
+(≈67 GB); Nano and Edge fit comfortably in any format.
 
 Weight-only quantization lowers RAM and download size, not compute time: int8 is no faster (slightly
 slower from the per-forward dequant), int4 ≈ bf16. The 4-step distilled schedule is the only real
