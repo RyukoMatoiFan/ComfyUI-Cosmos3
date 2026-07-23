@@ -196,6 +196,11 @@ Weight-only quantization lowers RAM and download size, not compute time: int8 is
 slower from the per-forward dequant), int4 ≈ bf16. The 4-step distilled schedule is the only real
 speedup (4 steps vs 35).
 
+The int4 format is W4A16 (int4 weights, bf16 activations). No GPU — Hopper or Blackwell — has an
+int4×bf16 tensor-core instruction, so W4A16 always runs as dequantize-to-bf16 then a bf16 matmul; the
+saving is memory/download only, with no compute speedup on any hardware. Blackwell's FP4 tensor cores
+accelerate NVFP4/MXFP4 (4-bit weights *and* activations), a different scheme not used here.
+
 **To use:** download the `*.safetensors` for a model, put it in `<checkpoint>/transformer/` renamed to
 `diffusion_pytorch_model.safetensors` (remove the bf16 shards and `*.index.json`), and keep the
 official `vae/`, tokenizers and `config.json`. The loader reads the format from the checkpoint
