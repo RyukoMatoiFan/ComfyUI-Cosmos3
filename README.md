@@ -154,11 +154,15 @@ Pre-quantized transformers for the official `transformer/` are hosted at
 | Format | Status | What it is | Nano | Super |
 |--------|--------|------------|------|-------|
 | int8 | available | weight-only int8, per-row scale + Hadamard (ConvRot) | 16.5 GB | 65.7 GB |
-| int4 | available (Nano, Super) | MLP int4 (GPTQ-calibrated + ConvRot Hadamard, AWQ W4A16 packing) + attention int8 | 12.4 GB | 46.8 GB |
+| int4 | available (all except Edge) | MLP int4 (GPTQ-calibrated + ConvRot Hadamard, AWQ W4A16 packing) + attention int8 | 12.4 GB | 46.8 GB |
+
+Both Super-Image2Video variants (`Cosmos3-Super-Image2Video` and `-4Step`) are also available in
+int4 at **46.7 GB** each (int8 is 65.6 GB each).
 
 Both are weight-only — activations stay bf16, so the effect is lower memory use, not faster
 inference (int4 is a little slower: it dequantizes per forward). They are lossy relative to bf16;
-int4 is slightly softer than int8. Compare against the bf16 checkpoint for your use case.
+int4 has larger quantization error than int8, so at a fixed seed its output diverges from the bf16
+result more than int8 does. Compare against the bf16 checkpoint for your use case.
 
 **To use:** download the `*.safetensors` for a model, put it in `<checkpoint>/transformer/` renamed to
 `diffusion_pytorch_model.safetensors` (remove the bf16 shards and `*.index.json`), and keep the
