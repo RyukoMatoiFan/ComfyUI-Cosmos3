@@ -164,6 +164,10 @@ inference (int4 is a little slower: it dequantizes per forward). They are lossy 
 int4 has larger quantization error than int8, so at a fixed seed its output diverges from the bf16
 result more than int8 does. Compare against the bf16 checkpoint for your use case.
 
+The int4 MLPs are GPTQ-calibrated on captured activations (plain round-to-nearest int4, even with the
+rotation, is too lossy on these two-tower models); the full step-by-step recipe with parameters is in
+the [weights card](https://huggingface.co/AkaneTendo25/Cosmos3-ConvRot#how-these-were-quantized).
+
 ### Measured footprint (H100, 832×480, 93 frames)
 
 Measured at the *minimum* VRAM the clip runs in (maximum streaming). **Min VRAM** is that floor — it
