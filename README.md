@@ -13,7 +13,7 @@ Supported checkpoints:
 | [`nvidia/Cosmos3-Super`](https://huggingface.co/nvidia/Cosmos3-Super) | text → video, image → video, joint audio-video |
 | [`nvidia/Cosmos3-Super-Image2Video`](https://huggingface.co/nvidia/Cosmos3-Super-Image2Video) | image → video, text → video (no audio branch) |
 | [`nvidia/Cosmos3-Super-Image2Video-4Step`](https://huggingface.co/nvidia/Cosmos3-Super-Image2Video-4Step) | image → video (DMD2-distilled, 4 steps, cfg 1) |
-| [`nvidia/Cosmos3-Edge`](https://huggingface.co/nvidia/Cosmos3-Edge) | text → video, image → video (compact Nemotron-dense backbone) |
+| [`nvidia/Cosmos3-Edge`](https://huggingface.co/nvidia/Cosmos3-Edge) | text → video, image → video (Nemotron-dense backbone) |
 
 The architecture is read from the checkpoint's `transformer/config.json`, so width, depth, base fps
 and the presence of the audio branch all follow the model you point the loader at.
@@ -164,41 +164,36 @@ inference (int4 is a little slower: it dequantizes per forward). They are lossy 
 int4 has larger quantization error than int8, so at a fixed seed its output diverges from the bf16
 result more than int8 does. Compare against the bf16 checkpoint for your use case.
 
-### Measured cost (H100, 832×480, 93 frames, seed 0)
+### Measured footprint (H100, 832×480, 93 frames)
 
-One clip, per format. "Time" is sampling + VAE decode. "RAM" is the resident weight size.
+Measured at the *minimum* VRAM the clip runs in (maximum streaming). **Min VRAM** is that floor — it
+is set by the activation working set (resolution × frame count), so it barely changes with the weight
+format. **RAM** is the peak host memory the process uses at that point. **Time** is sampling + VAE
+decode at the step count shown.
 
-| Model | Format | RAM (weights) | Peak VRAM | Time |
-|-------|--------|---------------|-----------|------|
-| Edge — t2v, 35 steps | bf16 | 5.8 GB | 12.7 GB | 18 s |
-| | int8 | 3.1 GB | 10.8 GB | 25 s |
-| | int4 | 2.4 GB | ~8.5 GB | 17 s |
-| Nano — t2v, 35 steps | bf16 | 27.1 GB | 34.9 GB | 47 s |
-| | int8 | 14.1 GB | 21.9 GB | 50 s |
-| | int4 | 10.3 GB | 17.5 GB | 49 s |
-| Super — t2v, 35 steps | bf16 | 117.8 GB | 80.2 GB | 168 s |
-| | int8 | 59.7 GB | 68.6 GB | 174 s |
-| | int4 | 42.1 GB | 50.9 GB | 168 s |
-| Super-Image2Video — i2v, 35 steps | bf16 | 117.8 GB | ≈ Super | 167 s |
-| | int8 | 59.7 GB | ≈ Super | 168 s |
-| | int4 | 42.1 GB | ≈ Super | 165 s |
-| Super-Image2Video-4Step — i2v, 4 steps | bf16 | 117.8 GB | ≈ Super | 42 s |
-| | int8 | 59.7 GB | ≈ Super | 20 s |
-| | int4 | 42.1 GB | ≈ Super | 16 s |
+| Model | Format | RAM | Min VRAM | Time |
+|-------|--------|-----|----------|------|
+| Edge — t2v, 35 steps | bf16 | 14 GB | **~6 GB** | 18 s |
+| | int8 | 7 GB | | 25 s |
+| | int4 | 7 GB | | 17 s |
+| Nano — t2v, 35 steps | bf16 | 58 GB | **~7 GB** | 47 s |
+| | int8 | 21 GB | | 50 s |
+| | int4 | 20 GB | | 49 s |
+| Super — t2v, 35 steps | bf16 | 240 GB | **~8 GB** | 168 s |
+| | int8 | 67 GB | | 174 s |
+| | int4 | 63 GB | | 168 s |
+| Super-Image2Video — i2v, 35 steps | bf16 | 240 GB | **~9 GB** | 167 s |
+| | int8 | 67 GB | | 168 s |
+| | int4 | 63 GB | | 165 s |
+| Super-Image2Video-4Step — i2v, 4 steps | bf16 | 240 GB | **~9 GB** | 42 s |
+| | int8 | 67 GB | | 20 s |
+| | int4 | 63 GB | | 16 s |
 
-**Peak VRAM here is with the dynamic-VRAM budget off (`--reserve-vram 0`)** — the manager keeps as
-much as fits resident instead of streaming to a target, so it tracks the weight size and is a
-near-worst case. With a VRAM budget set, peak drops toward the activation floor (a few GB). Super-bf16
-(117.8 GB) exceeds one 80 GB card, so it still streams and pegs at the card limit. The i2v pair shares
-the Super backbone, so its VRAM matches the Super rows.
-
-**Running on a small GPU / limited RAM.** Because the transformer streams from system RAM to the GPU
-per layer, it runs on GPUs much smaller than the checkpoint. The split is tunable: a tighter VRAM
-budget keeps more weights resident in system RAM and streams more per step, so **VRAM and system RAM
-trade off against each other** — lowering the VRAM requirement raises the RAM footprint and slows
-sampling (more streaming). VRAM has a floor set by the activation working set (resolution × frame
-count), not the weight size, so quantization does not lower that floor. Net: the quantized checkpoints
-fit modest GPUs given enough system RAM — the memory does not vanish, it moves between VRAM and RAM.
+RAM and VRAM trade off: these are at the minimum VRAM (maximum streaming); giving the GPU more VRAM
+holds more weights on-card, which lowers the RAM figure and speeds sampling. bf16 host RAM peaks near
+twice the weight size (staging), so the Super family is impractical in bf16 without a very large host.
+For that family the int4 checkpoints fit a **64 GB** host (~63 GB), while int8 needs a little more
+(~67 GB); Nano and Edge fit comfortably in any format.
 
 Weight-only quantization lowers RAM and download size, not compute time: int8 is no faster (slightly
 slower from the per-forward dequant), int4 ≈ bf16. The 4-step distilled schedule is the only real
