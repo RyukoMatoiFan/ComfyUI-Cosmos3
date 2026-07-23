@@ -154,7 +154,7 @@ Pre-quantized transformers for the official `transformer/` are hosted at
 | Format | Status | What it is | Nano | Super |
 |--------|--------|------------|------|-------|
 | int8 | available | weight-only int8, per-row scale + Hadamard (ConvRot) | 16.5 GB | 65.7 GB |
-| int4 | available (all except Edge) | MLP int4 (GPTQ-calibrated + ConvRot Hadamard, AWQ W4A16 packing) + attention int8 | 12.4 GB | 46.8 GB |
+| int4 | available (all models) | MLP int4 (GPTQ-calibrated + ConvRot Hadamard, AWQ W4A16 packing) + attention int8 | 12.4 GB | 46.8 GB |
 
 Both Super-Image2Video variants (`Cosmos3-Super-Image2Video` and `-4Step`) are also available in
 int4 at **46.7 GB** each (int8 is 65.6 GB each).
@@ -164,12 +164,50 @@ inference (int4 is a little slower: it dequantizes per forward). They are lossy 
 int4 has larger quantization error than int8, so at a fixed seed its output diverges from the bf16
 result more than int8 does. Compare against the bf16 checkpoint for your use case.
 
+### Measured cost (H100, 832×480, 93 frames, seed 0)
+
+One clip, per format. "Time" is sampling + VAE decode. "RAM" is the resident weight size.
+
+| Model | Format | RAM (weights) | Peak VRAM | Time |
+|-------|--------|---------------|-----------|------|
+| Edge — t2v, 35 steps | bf16 | 5.8 GB | 12.7 GB | 18 s |
+| | int8 | 3.1 GB | 10.8 GB | 25 s |
+| | int4 | 2.4 GB | ~8.5 GB | 17 s |
+| Nano — t2v, 35 steps | bf16 | 27.1 GB | 34.9 GB | 47 s |
+| | int8 | 14.1 GB | 21.9 GB | 50 s |
+| | int4 | 10.3 GB | 17.5 GB | 49 s |
+| Super — t2v, 35 steps | bf16 | 117.8 GB | 80.2 GB | 168 s |
+| | int8 | 59.7 GB | 68.6 GB | 174 s |
+| | int4 | 42.1 GB | 50.9 GB | 168 s |
+| Super-Image2Video — i2v, 35 steps | bf16 | 117.8 GB | ≈ Super | 167 s |
+| | int8 | 59.7 GB | ≈ Super | 168 s |
+| | int4 | 42.1 GB | ≈ Super | 165 s |
+| Super-Image2Video-4Step — i2v, 4 steps | bf16 | 117.8 GB | ≈ Super | 42 s |
+| | int8 | 59.7 GB | ≈ Super | 20 s |
+| | int4 | 42.1 GB | ≈ Super | 16 s |
+
+**Peak VRAM here is with the dynamic-VRAM budget off (`--reserve-vram 0`)** — the manager keeps as
+much as fits resident instead of streaming to a target, so it tracks the weight size and is a
+near-worst case. With a VRAM budget set, peak drops toward the activation floor (a few GB). Super-bf16
+(117.8 GB) exceeds one 80 GB card, so it still streams and pegs at the card limit. The i2v pair shares
+the Super backbone, so its VRAM matches the Super rows.
+
+Weight-only quantization lowers RAM and download size, not compute time: int8 is no faster (slightly
+slower from the per-forward dequant), int4 ≈ bf16. The 4-step distilled schedule is the only real
+speedup (4 steps vs 35).
+
 **To use:** download the `*.safetensors` for a model, put it in `<checkpoint>/transformer/` renamed to
 `diffusion_pytorch_model.safetensors` (remove the bf16 shards and `*.index.json`), and keep the
 official `vae/`, tokenizers and `config.json`. The loader reads the format from the checkpoint
 metadata — load with `weight_dtype = default`; no workflow or node change is needed. Requires a
 ComfyUI build with comfy-kitchen (int8 from ≥ 0.27; int4 uses its AWQ W4A16 layout, dequantized
 weight-only with the ConvRot rotation undone at load, so the quantized matmul is deterministic).
+
+**Prompting Cosmos3-Edge:** Edge is trained on JSON-structured prompts and is less robust to plain
+text than the larger Nano/Super. Plain text usually works, but on some detailed scenes (notably
+reflective surfaces) it can produce flare/pulsation artifacts; wrapping the text as
+`{"temporal_caption": "<your prompt>"}` avoids them. This is a base-model property, independent of
+quantization (it shows in bf16 too).
 
 ## Limitations
 
