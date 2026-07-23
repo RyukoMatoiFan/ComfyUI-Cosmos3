@@ -147,23 +147,24 @@ to fit.
 
 ## Quantized weights
 
-Pre-quantized ConvRot transformers for the official `transformer/` are hosted at
+Pre-quantized transformers for the official `transformer/` are hosted at
 [`AkaneTendo25/Cosmos3-ConvRot`](https://huggingface.co/AkaneTendo25/Cosmos3-ConvRot).
 
 | Format | Status | What it is | Nano | Super |
 |--------|--------|------------|------|-------|
-| int8-ConvRot | available | weight-only int8, per-row scale + Hadamard rotation | ~16 GB | ~62 GB |
-| int4-ConvRot | not yet published | MLP int4 (GPTQ-calibrated) + attention int8 | ~9.5 GB | ~38 GB |
+| int8 | available | weight-only int8, per-row scale + Hadamard (ConvRot) | ~16 GB | ~62 GB |
+| int4 | available | MLP int4 (GPTQ-calibrated, AWQ W4A16 packing) + attention int8 | ~12 GB | ~47 GB |
 
 Both are weight-only — activations stay bf16, so the effect is lower memory use, not faster
-inference. They are lossy relative to bf16; compare against the bf16 checkpoint for your use case.
+inference (int4 is a little slower: it dequantizes per forward). They are lossy relative to bf16;
+int4 is a little softer than int8. Compare against the bf16 checkpoint for your use case.
 
 **To use:** download the `*.safetensors` for a model, put it in `<checkpoint>/transformer/` renamed to
 `diffusion_pytorch_model.safetensors` (remove the bf16 shards and `*.index.json`), and keep the
-official `vae/`, tokenizers and `config.json`. The loader reads the ConvRot format from the checkpoint
+official `vae/`, tokenizers and `config.json`. The loader reads the format from the checkpoint
 metadata — load with `weight_dtype = default`; no workflow or node change is needed. Requires a
-ComfyUI build with native ConvRot support (comfy-kitchen; int8 from ≥ 0.27, int4 from the convrot-int4
-build).
+ComfyUI build with comfy-kitchen (int8 from ≥ 0.27; int4 uses its AWQ W4A16 layout, dequantized
+weight-only so the quantized matmul is deterministic).
 
 ## Limitations
 
