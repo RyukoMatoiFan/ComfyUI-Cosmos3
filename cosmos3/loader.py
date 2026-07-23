@@ -243,18 +243,47 @@ def load_cosmos3_model(
             # matmul is deterministic, so the quantized model tracks the plain-bf16 trajectory.
             # Both formats are weight-only, so this only changes the matmul kernel, not the
             # numerics beyond determinism.
-            from comfy_kitchen.tensor.base import register_layout_op as _rlo, dequantize_args as _dqa
+            from comfy_kitchen.tensor.base import (
+                register_layout_op as _rlo, dequantize_args as _dqa, QuantizedTensor as _QTb,
+            )
             from comfy_kitchen.tensor.awq_w4a16 import TensorCoreAWQW4A16Layout as _AWQL
             from comfy_kitchen.tensor.int8 import TensorWiseINT8Layout as _I8L
 
-            def _deq(op):
+            _hcache = {}
+            def _hmat(n, device, dtype):
+                key = (n, device, dtype)
+                if key not in _hcache:
+                    H = torch.ones(1, 1, device=device, dtype=torch.float32)
+                    while H.shape[0] < n:
+                        H = torch.cat([torch.cat([H, H], 1), torch.cat([H, -H], 1)], 0)
+                    _hcache[key] = (H / (n ** 0.5)).to(dtype)
+                return _hcache[key]
+
+            def _deq_int8(op):
                 def _h(_qt, args, kwargs):
                     return op(*_dqa(args), **_dqa(kwargs))
                 return _h
-            for _layout in (_AWQL, _I8L):
-                for _op in (torch.ops.aten.linear.default, torch.ops.aten.mm.default,
-                            torch.ops.aten.addmm.default):
-                    _rlo(_op, _layout)(_deq(_op))
+
+            def _deq_awq(op):
+                # Dequantize the AWQ int4 weight, then undo the pack-time Hadamard rotation
+                # (per group of group_size). Our int4 MLPs are always ConvRot-rotated.
+                def _h(_qt, args, kwargs):
+                    new = []
+                    for a in args:
+                        if isinstance(a, _QTb) and getattr(a, "_layout_cls", None) == "TensorCoreAWQW4A16Layout":
+                            w = a.dequantize()
+                            g = int(getattr(a._params, "group_size", 32))
+                            o, i = w.shape
+                            w = (w.reshape(o, i // g, g) @ _hmat(g, w.device, w.dtype)).reshape(o, i)
+                            new.append(w)
+                        else:
+                            new.append(_dqa(a))
+                    return op(*new, **_dqa(kwargs))
+                return _h
+            for _op in (torch.ops.aten.linear.default, torch.ops.aten.mm.default,
+                        torch.ops.aten.addmm.default):
+                _rlo(_op, _AWQL)(_deq_awq(_op))
+                _rlo(_op, _I8L)(_deq_int8(_op))
 
     offload_device = comfy.model_management.unet_offload_device()
     load_device = comfy.model_management.get_torch_device()
