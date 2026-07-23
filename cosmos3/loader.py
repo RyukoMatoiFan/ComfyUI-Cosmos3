@@ -221,6 +221,40 @@ def load_cosmos3_model(
         model_config.custom_operations = comfy.ops.mixed_precision_ops(
             quant_config, torch.bfloat16
         )
+        # awq_w4a16 (our int4 MLP format) isn't in comfy's QUANT_ALGOS. Register it so the
+        # mixed-precision Linear forward treats it as weight-only (quantize_input=False)
+        # instead of defaulting to True and trying to quantize activations — AWQ.quantize is
+        # offline-only and would raise. The load itself is handled by our own construction
+        # below (comfy's _load_quantized_module has no awq branch).
+        import comfy.quant_ops as _qops
+        if "awq_w4a16" not in _qops.QUANT_ALGOS:
+            _qops.QUANT_ALGOS["awq_w4a16"] = {
+                "storage_t": torch.int8,
+                "parameters": {"weight_scale", "weight_zeros"},
+                "comfy_tensor_layout": "TensorCoreAWQW4A16Layout",
+                "quantize_input": False,
+            }
+            # comfy_kitchen's AWQ layout dispatches F.linear to its gemv_awq_w4a16 kernel,
+            # which produces wrong output for large weight shapes. Re-register linear/mm/addmm
+            # to dequantize-then-run instead — correct, and still streams the packed int4
+            # weight (dequant happens per-forward). Global but only affects AWQ.
+            # Route int8_tensorwise the same way: its int8 GEMM uses non-deterministic atomics,
+            # which jitters the denoising trajectory frame-to-frame. A dequantize-then-bf16
+            # matmul is deterministic, so the quantized model tracks the plain-bf16 trajectory.
+            # Both formats are weight-only, so this only changes the matmul kernel, not the
+            # numerics beyond determinism.
+            from comfy_kitchen.tensor.base import register_layout_op as _rlo, dequantize_args as _dqa
+            from comfy_kitchen.tensor.awq_w4a16 import TensorCoreAWQW4A16Layout as _AWQL
+            from comfy_kitchen.tensor.int8 import TensorWiseINT8Layout as _I8L
+
+            def _deq(op):
+                def _h(_qt, args, kwargs):
+                    return op(*_dqa(args), **_dqa(kwargs))
+                return _h
+            for _layout in (_AWQL, _I8L):
+                for _op in (torch.ops.aten.linear.default, torch.ops.aten.mm.default,
+                            torch.ops.aten.addmm.default):
+                    _rlo(_op, _layout)(_deq(_op))
 
     offload_device = comfy.model_management.unet_offload_device()
     load_device = comfy.model_management.get_torch_device()
@@ -298,10 +332,49 @@ def load_cosmos3_model(
 
     if weight_dtype == "int8" or prequant:
         quant_sd = model_config.process_unet_state_dict(quant_sd)
+        # AWQ int4 (awq_w4a16) layers: comfy's native _load_quantized_module doesn't know
+        # this format, so pop their parts and build the QuantizedTensor here (int8_tensorwise
+        # and bf16 layers load natively below). Mirrors comfy's own QuantizedTensor construction.
+        awq = {}
+        for k in [k for k in quant_sd if k.endswith(".comfy_quant")]:
+            conf = json.loads(bytes(quant_sd[k].tolist()).decode("utf-8"))
+            if conf.get("format") != "awq_w4a16":
+                continue
+            base = k[: -len(".comfy_quant")]
+            awq[base] = {
+                "qweight": quant_sd.pop(base + ".weight"),
+                "scale": quant_sd.pop(base + ".weight_scale"),
+                "zeros": quant_sd.pop(base + ".weight_zeros"),
+                "group_size": int(conf.get("group_size", 32)),
+                "orig_shape": tuple(conf.get("orig_shape")),
+            }
+            del quant_sd[k]
         _, unexpected = target.load_state_dict(quant_sd, strict=False)
         loaded.update(k for k in quant_sd if k in expected)
         unexpected_all.extend(unexpected)
         del quant_sd
+        if awq:
+            from comfy_kitchen.tensor.awq_w4a16 import TensorCoreAWQW4A16Layout as _AWQ
+            from comfy_kitchen.tensor.base import QuantizedTensor as _QT
+            for base, p in awq.items():
+                mod = target.get_submodule(base)
+                params = _AWQ.Params(
+                    scale=p["scale"].to(offload_device),
+                    zeros=p["zeros"].to(offload_device),
+                    group_size=p["group_size"],
+                    orig_dtype=torch.bfloat16,
+                    orig_shape=p["orig_shape"],
+                )
+                qt = _QT(p["qweight"].to(offload_device), "TensorCoreAWQW4A16Layout", params)
+                mod.weight = torch.nn.Parameter(qt, requires_grad=False)
+                # Mirror the attributes comfy's own _load_quantized_module sets, so the
+                # module behaves like a natively-loaded quantized layer (forward + state_dict).
+                mod.quant_format = "awq_w4a16"
+                mod.layout_type = "TensorCoreAWQW4A16Layout"
+                mod._full_precision_mm_config = False
+                loaded.add(base + ".weight")
+            logger.info("Built %d AWQ int4 (awq_w4a16) layers", len(awq))
+        del awq
 
     if weight_dtype == "fp8_e4m3fn":
         logger.info("Cast %d weights to fp8_e4m3fn", fp8_count)
