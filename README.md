@@ -192,6 +192,14 @@ near-worst case. With a VRAM budget set, peak drops toward the activation floor 
 (117.8 GB) exceeds one 80 GB card, so it still streams and pegs at the card limit. The i2v pair shares
 the Super backbone, so its VRAM matches the Super rows.
 
+**Running on a small GPU / limited RAM.** Because the transformer streams from system RAM to the GPU
+per layer, it runs on GPUs much smaller than the checkpoint. The split is tunable: a tighter VRAM
+budget keeps more weights resident in system RAM and streams more per step, so **VRAM and system RAM
+trade off against each other** — lowering the VRAM requirement raises the RAM footprint and slows
+sampling (more streaming). VRAM has a floor set by the activation working set (resolution × frame
+count), not the weight size, so quantization does not lower that floor. Net: the quantized checkpoints
+fit modest GPUs given enough system RAM — the memory does not vanish, it moves between VRAM and RAM.
+
 Weight-only quantization lowers RAM and download size, not compute time: int8 is no faster (slightly
 slower from the per-forward dequant), int4 ≈ bf16. The 4-step distilled schedule is the only real
 speedup (4 steps vs 35).
