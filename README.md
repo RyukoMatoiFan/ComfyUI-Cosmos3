@@ -58,7 +58,7 @@ recommended there.
 
 | Node | Purpose · key inputs → outputs |
 |------|--------------------------------|
-| **Cosmos3 Loader** | Load the model. `weight_dtype` = `default` (bf16), `fp8_e4m3fn`, or `int8` (on-the-fly ComfyUI-native int8). Pre-quantized ConvRot checkpoints (see [Quantized weights](#quantized-weights)) are auto-detected from their metadata — load those with `default`. → `MODEL`, `COSMOS3_TEXT_ENCODER`, `VAE`, `COSMOS3_AUDIO_VAE` (empty on checkpoints without audio) |
+| **Cosmos3 Loader** | Load the model. `weight_dtype` = `default` (bf16), `fp8_e4m3fn`, or `int8` (on-the-fly ComfyUI-native int8). Pre-quantized checkpoints (see [Quantized weights](#quantized-weights)) are auto-detected from their metadata — load those with `default`. → `MODEL`, `COSMOS3_TEXT_ENCODER`, `VAE`, `COSMOS3_AUDIO_VAE` (empty on checkpoints without audio) |
 | **Cosmos3 Text Encode** | Tokenize a prompt (chat template + optional resolution/duration metadata). Set `width`/`height`/`num_frames`/`fps` to match the latent. → `CONDITIONING` |
 | **Cosmos3 Default Negative Prompt** | Returns the checkpoint's bundled `assets/negative_prompt.json` as a STRING — wire into a negative Text Encode. Returns an empty string when the checkpoint ships no such file. → `STRING` |
 | **Cosmos3 Empty Latent Video** | Zero latent `[B, 48, (length-1)//4+1, H/16, W/16]`. → `LATENT` |
@@ -78,10 +78,11 @@ The frame-count widgets accept up to **401** frames.
 
 ## Example workflows
 
-Drag a JSON onto the canvas. All four share the same sampling setup — 832×480, 35 steps, cfg 6.0,
-`uni_pc_bh2`, `flow_shift` 5.0 (the 480p value), bf16 weights — so they differ only in what is
-being generated. They also work with the [quantized checkpoints](#quantized-weights): point the
-loader at a folder whose `transformer/` holds a ConvRot file and it loads from the metadata.
+Drag a JSON onto the canvas. All graphs except the 4-step one share the same sampling setup —
+832×480, 35 steps, cfg 6.0, `uni_pc_bh2`, `flow_shift` 5.0 (the 480p value) — and differ only in what
+is generated; `cosmos3_super_i2v_4step.json` uses its own 4-step schedule (see below). They also work
+with the [quantized checkpoints](#quantized-weights): point the loader at a folder whose
+`transformer/` holds a quantized file and it loads from the metadata.
 
 **`cosmos3_t2v.json` — text to video.** The baseline graph: prompt → `Cosmos3 Text Encode`, an
 empty latent from `Cosmos3 Empty Latent Video`, sampled and decoded to 93 frames at 24 fps (3.9 s).
@@ -116,11 +117,11 @@ into the negative Text Encode if you want one.
 sampler switched to **euler**, and `CFGGuider` cfg **1.0** (the model is guidance-distilled, so no
 CFG). fps stays 16. Four steps instead of 35.
 
-**`cosmos3_edge_t2v.json` — Cosmos3-Edge text to video.** The compact, high-throughput variant.
-Same graph as `cosmos3_t2v.json` (fps 24) pointed at `Cosmos3-Edge`. Edge is a different backbone
-(`cosmos3_edge_nemotron_dense`: squared-ReLU non-gated MLP, no text QK-norm, its own Nemotron
-tokenizer) — the loader picks all of this up from `transformer/config.json`, so no extra setup is
-needed. Small and fast, with correspondingly lower fidelity than Nano/Super.
+**`cosmos3_edge_t2v.json` — Cosmos3-Edge text to video.** Same graph as `cosmos3_t2v.json` (fps 24)
+pointed at `Cosmos3-Edge`. Edge is a different backbone (`cosmos3_edge_nemotron_dense`: squared-ReLU
+non-gated MLP, no text QK-norm, its own Nemotron tokenizer) — the loader reads all of this from
+`transformer/config.json`, so no extra setup is needed. It is a smaller model with lower output
+fidelity than Nano/Super.
 
 **For I2V + audio**, chain Text Encode → Image to Video → Empty AV Latent Video (use the AV node's
 latent; discard the I2V one), then sample as usual.
@@ -131,7 +132,7 @@ latent; discard the I2V one), then sample as usual.
 prompts work, and NVIDIA's JSON-upsampled prompts (cosmos-framework) can be pasted directly into
 the prompt field.
 
-Set `fps` to the checkpoint's `base_fps` — **24 for Cosmos3-Nano and Cosmos3-Super, 16 for both Cosmos3-Super-Image2Video variants (incl. -4Step)** — in Text
+Set `fps` to the checkpoint's `base_fps` — **24 for Cosmos3-Nano, Cosmos3-Super and Cosmos3-Edge; 16 for both Cosmos3-Super-Image2Video variants (incl. -4Step)** — in Text
 Encode, the AV latent node and `CreateVideo`. It feeds the duration metadata sentence and the
 temporal position ids, so a mismatch shows up as wrong pacing. At 24 fps, 189 frames is 7.9 s.
 
@@ -152,19 +153,19 @@ Pre-quantized transformers for the official `transformer/` are hosted at
 
 | Format | Status | What it is | Nano | Super |
 |--------|--------|------------|------|-------|
-| int8 | available | weight-only int8, per-row scale + Hadamard (ConvRot) | ~16 GB | ~62 GB |
-| int4 | available | MLP int4 (GPTQ-calibrated, AWQ W4A16 packing) + attention int8 | ~12 GB | ~47 GB |
+| int8 | available | weight-only int8, per-row scale + Hadamard (ConvRot) | 16.5 GB | 65.7 GB |
+| int4 | available (Nano, Super) | MLP int4 (GPTQ-calibrated + ConvRot Hadamard, AWQ W4A16 packing) + attention int8 | 12.4 GB | 46.8 GB |
 
 Both are weight-only — activations stay bf16, so the effect is lower memory use, not faster
 inference (int4 is a little slower: it dequantizes per forward). They are lossy relative to bf16;
-int4 is a little softer than int8. Compare against the bf16 checkpoint for your use case.
+int4 is slightly softer than int8. Compare against the bf16 checkpoint for your use case.
 
 **To use:** download the `*.safetensors` for a model, put it in `<checkpoint>/transformer/` renamed to
 `diffusion_pytorch_model.safetensors` (remove the bf16 shards and `*.index.json`), and keep the
 official `vae/`, tokenizers and `config.json`. The loader reads the format from the checkpoint
 metadata — load with `weight_dtype = default`; no workflow or node change is needed. Requires a
 ComfyUI build with comfy-kitchen (int8 from ≥ 0.27; int4 uses its AWQ W4A16 layout, dequantized
-weight-only so the quantized matmul is deterministic).
+weight-only with the ConvRot rotation undone at load, so the quantized matmul is deterministic).
 
 ## Limitations
 
