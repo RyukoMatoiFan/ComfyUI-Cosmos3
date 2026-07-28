@@ -197,12 +197,20 @@ device (36 × 2 × 300 × 8 × 128 × 2 B ≈ 44 MB for a 300-token prompt at th
 prompt, so CFG holds two. A LoRA patching und-side keys must be applied to the und tower's patcher;
 the `patches_uuid` cache invalidation in `model.py` covers only the bundled path.
 
-Verified on H100 against a 36-layer, hidden 4096 checkpoint in three weight formats — bf16, int8 and
-int4/ConvRot. In each, velocity output is **bitwise identical** between the bundled and split paths
-(`torch.equal` True, against reference magnitudes mean |v| 0.28–0.92), both halves load with no
-missing keys, and peak RSS does not rise when the generator is loaded after the reasoner is
-released, so the two halves are not resident together. Per-format memory figures are in
-[Measured footprint](#measured-footprint-h100-832480-93-frames).
+Verified on H100 against a 36-layer, hidden 4096 checkpoint, 832×480×93, 35 steps, `uni_pc_bh2`.
+Both halves load with no missing keys in every weight format tried, and the reasoner's per-layer K/V
+are bitwise identical whether produced by the bundled model or by a separately-loaded und tower.
+
+| format | denoised latent, bundled vs split |
+|---|---|
+| bf16 | bitwise identical over the full 35 steps |
+| int8 | bitwise identical over the full 35 steps |
+| int4 / ConvRot | identical for a single forward and for one sampler step; **diverges from the second step on** |
+
+**int4 is not yet equivalent under the split path.** The cause is not the reasoner: its K/V match
+bitwise, and the first denoising step matches bitwise, so the divergence appears only once the
+sampler iterates. Until that is resolved, use `split_reasoner` with bf16 or int8, and expect a
+different (not necessarily worse) result from int4.
 
 The partition covers the Nano/Super and Edge backbones, with and without the audio branch.
 
@@ -228,9 +236,9 @@ The int4 MLPs are GPTQ-calibrated on captured activations (plain round-to-neares
 rotation, is too lossy on these two-tower models); the full step-by-step recipe with parameters is in
 the [weights card](https://huggingface.co/AkaneTendo25/Cosmos3-ConvRot#how-these-were-quantized).
 
-### Measured footprint (H100, 832×480, 93 frames)
+### Measured footprint
 
-Measured at the *minimum* VRAM the clip runs in (maximum streaming). **Min VRAM** is that floor — it
+H100, 832×480, 93 frames. Measured at the *minimum* VRAM the clip runs in (maximum streaming). **Min VRAM** is that floor — it
 is set by the activation working set (resolution × frame count), so it barely changes with the weight
 format. **RAM** is the peak host memory the process uses at that point. **Time** is sampling + VAE
 decode at the step count shown.
@@ -258,19 +266,24 @@ The table is with the reasoner bundled (the default). With
 model, and peak host memory is set by whichever half is larger — the und tower, at 52.1 % of the
 weights — instead of by the sum.
 
-No row above has been re-run split. The split was measured separately, one forward per run, on Nano:
+The rows above are not re-stated for the split path, because the split was measured with a different
+instrument (the sampled model's own size and the GPU peak, rather than this column's host figure).
+Nano, same clip and step count, measured through the nodes:
 
-| checkpoint | latent | bundled | split |
+| Format | Sampled model | Peak VRAM | Time |
 |---|---|---|---|
-| bf16, 28.26 GB | 8×8×2 | 32.04 GB | 16.83 GB |
-| int8 | 832×480×93 | 15.05 GB | 8.37 GB |
-| int4 | 832×480×93 | 13.20 GB | 7.57 GB |
+| bf16 — bundled | 27.07 GB | 33.3 GB | 39.5 s |
+| bf16 — split | 12.98 GB | 19.3 GB | 36.9 s |
+| int8 — bundled | 14.15 GB | 20.4 GB | 48.7 s |
+| int8 — split | 6.51 GB | 12.8 GB | 44.5 s |
+| int4 — bundled | 10.34 GB | 16.6 GB | 48.2 s |
+| int4 — split | 4.61 GB | 10.9 GB | 44.4 s |
 
-In each case peak RSS was reached while loading the und tower and did not rise when the generator
-was loaded afterwards. These absolute figures are not comparable to the rows above, which sample 35
-steps and then VAE-decode; what carries over is that peak falls by roughly the size of the und half,
-so the Super rows would drop by tens of GB. Super itself was not part of the run. Min VRAM and time
-are unaffected in either mode: the prefill runs once per prompt in both.
+**Sampled model** is what the denoiser holds: the gen half alone under split, so it drops by the und
+share. The und tower (5.7 GB int4 to 14.1 GB bf16) is loaded before it and released, which is why
+peak, not the sampled size, is what a host has to accommodate. Peak VRAM falls too, because a
+smaller model streams less. Sampling is a little faster for the same reason, though the prefill
+itself runs once per prompt in both modes. Super was not part of this run.
 
 RAM and VRAM trade off: these are at the minimum VRAM (maximum streaming); giving the GPU more VRAM
 holds more weights on-card, which lowers the RAM figure and speeds sampling. bf16 host RAM peaks near
