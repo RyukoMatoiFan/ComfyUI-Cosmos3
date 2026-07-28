@@ -242,32 +242,36 @@ is set by the activation working set (resolution × frame count), so it barely c
 format. **RAM** is the peak host memory the process uses at that point. **Time** is sampling + VAE
 decode at the step count shown.
 
-| Model | Format | RAM | Min VRAM | Time |
-|-------|--------|-----|----------|------|
-| Edge — t2v, 35 steps | bf16 | 14 GB | **≈6 GB** | 18 s |
-| | int8 | 7 GB | | 25 s |
-| | int4 | 7 GB | | 17 s |
-| Nano — t2v, 35 steps | bf16 | 58 GB | **≈7 GB** | 47 s |
-| | int8 | 21 GB | | 50 s |
-| | int4 | 20 GB | | 49 s |
-| Super — t2v, 35 steps | bf16 | 240 GB | **≈8 GB** | 168 s |
-| | int8 | 67 GB | | 174 s |
-| | int4 | 63 GB | | 168 s |
-| Super-Image2Video — i2v, 35 steps | bf16 | 240 GB | **≈9 GB** | 167 s |
-| | int8 | 67 GB | | 168 s |
-| | int4 | 63 GB | | 165 s |
-| Super-Image2Video-4Step — i2v, 4 steps | bf16 | 240 GB | **≈9 GB** | 42 s |
-| | int8 | 67 GB | | 20 s |
-| | int4 | 63 GB | | 16 s |
+| Model | Format | RAM | Min VRAM | Time | Weights: bundled → split (und / gen) |
+|-------|--------|-----|----------|------|------|
+| Edge — t2v, 35 steps | bf16 | 14 GB | **≈6 GB** | 18 s | 5.76 → 3.13 / 2.64 GB |
+| | int8 | 7 GB | | 25 s | 3.14 → 1.81 / 1.32 GB |
+| | int4 | 7 GB | | 17 s | 2.40 → 1.44 / 0.95 GB |
+| Nano — t2v, 35 steps | bf16 | 58 GB | **≈7 GB** | 47 s | 27.07 → 14.10 / 12.98 GB |
+| | int8 | 21 GB | | 50 s | 14.15 → 7.63 / 6.51 GB |
+| | int4 | 20 GB | | 49 s | 10.34 → 5.73 / 4.61 GB |
+| Super — t2v, 35 steps | bf16 | 240 GB | **≈8 GB** | 168 s | 117.76 → 59.58 / 58.18 GB |
+| | int8 | 67 GB | | 174 s | 59.67 → 30.53 / 29.14 GB |
+| | int4 | 63 GB | | 168 s | 42.06 → 21.73 / 20.33 GB |
+| Super-Image2Video — i2v, 35 steps | bf16 | 240 GB | **≈9 GB** | 167 s | 117.76 → 59.58 / 58.18 GB |
+| | int8 | 67 GB | | 168 s | 59.67 → 30.53 / 29.14 GB |
+| | int4 | 63 GB | | 165 s | 42.06 → 21.73 / 20.33 GB |
+| Super-Image2Video-4Step — i2v, 4 steps | bf16 | 240 GB | **≈9 GB** | 42 s | 117.76 → 59.58 / 58.18 GB |
+| | int8 | 67 GB | | 20 s | 59.67 → 30.53 / 29.14 GB |
+| | int4 | 63 GB | | 16 s | 42.06 → 21.73 / 20.33 GB |
 
 The table is with the reasoner bundled (the default). With
 [`split_reasoner`](#splitting-the-reasoner) the und parameters are never constructed in the sampled
 model, and peak host memory is set by whichever half is larger — the und tower, at 52.1 % of the
 weights — instead of by the sum.
 
-The rows above are not re-stated for the split path, because the split was measured with a different
-instrument (the sampled model's own size and the GPU peak, rather than this column's host figure).
-Nano, same clip and step count, measured through the nodes:
+The last column is weight bytes, read from each checkpoint's tensor headers, not a runtime figure
+like RAM: the loaded total, then what each half holds under
+[`split_reasoner`](#splitting-the-reasoner). The denoiser holds the **gen** half for the whole run;
+the **und** half is loaded first and released, so it — the larger of the two, 51–60 % depending on
+model and format — is what bounds peak memory. RAM and Min VRAM are bundled-path measurements and
+are not re-stated for the split, which was measured with a different instrument. Nano, same clip and
+step count, through the nodes:
 
 | Format | Sampled model | Peak VRAM | Time |
 |---|---|---|---|
