@@ -261,11 +261,15 @@ decode at the step count shown.
 
 The table is with the reasoner bundled (the default). With
 [`split_reasoner`](#splitting-the-reasoner) the und parameters are never constructed in the sampled
-model, so the RAM column is bounded by the gen half rather than by both. Measured on a bf16
-checkpoint, peak RSS went 32.04 → 16.83 GB (−47.5 %, against a 47.9 % gen share of loaded weights).
-Applying that ratio to the rows above gives Super int4 ≈33 GB and Nano int4 ≈11 GB; those two are
-extrapolated, not measured on those checkpoints. Min VRAM and time are unaffected — the prefill
-already ran once per prompt.
+model, so the RAM figure is bounded by the gen half rather than by both.
+
+No row above has been re-run split. The split was measured on its own, under lighter conditions — a
+single forward at an 8×8×2 latent with 16 text tokens on a 28.26 GB bf16 checkpoint — where peak RSS
+went 32.04 → 16.83 GB, a 47.5 % drop against a 47.9 % gen share of the loaded weights. Those absolute
+figures are not comparable to the rows above, which sample 35 steps at 832×480×93 and so carry a far
+larger activation and staging peak; only the ratio carries over. Scaling the rows by the gen share
+puts Super int4 near 33 GB and Nano int4 near 11 GB — arithmetic, not measurements. Min VRAM and time
+are unaffected in either mode: the prefill runs once per prompt in both.
 
 RAM and VRAM trade off: these are at the minimum VRAM (maximum streaming); giving the GPU more VRAM
 holds more weights on-card, which lowers the RAM figure and speeds sampling. bf16 host RAM peaks near
