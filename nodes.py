@@ -133,7 +133,9 @@ class Cosmos3UndTowerLoader:
     denoising step — it can run once, like a text encoder, and then be offloaded.
 
     Feed this into Cosmos3 Text Encode and set split_reasoner on the loader that
-    provides the MODEL, so the two halves are never resident together.
+    provides the MODEL. The denoiser then holds only the gen half on the GPU,
+    which is where the saving is; host RAM is unchanged, since the main loader
+    runs first and both halves are staged there by the time this one loads.
 
     Point it at the same model_dir as the main loader; no separate download is
     needed, the other half's tensors are skipped as the shards stream past.

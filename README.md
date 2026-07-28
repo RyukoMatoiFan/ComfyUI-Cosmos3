@@ -188,9 +188,17 @@ and `gen/` trees if you also want the disk and download halved; it imports the s
 (`cosmos3/towers.py`) the loader uses, and carries per-layer quantization metadata with its tensors,
 so int8 and int4/ConvRot checkpoints split unchanged.
 
-Where the reduction lands depends on the loading mode. Under streaming, weights sit in host RAM and
-page to VRAM per forward, so min VRAM is activation-bound and unchanged; the saving is in host RAM.
-With weights held on-card it is VRAM instead. Step time is unchanged either way.
+The saving is in VRAM, not host RAM. Measured on Nano, 832×480×93: peak VRAM 34.4 → 20.2 GB in
+bf16 and 16.8 → 11.8 GB in int4, with sampling a few percent faster because a smaller model streams
+per step. Host RAM is unchanged — `Cosmos3 Loader` provides the tokenizer and so must run before
+`Cosmos3 Text Encode`, which leaves the denoiser's weights staged in host RAM while the reasoner
+loads, putting both halves resident at the peak (31.89 → 31.30 GB in bf16).
+
+Two consequences follow. If host RAM is the binding constraint, this feature does not help — reach
+for a [quantized checkpoint](#quantized-weights) instead. And the VRAM saving only materialises if
+the reasoner is released after the prefill: ComfyUI caches node outputs, so holding onto the
+`COSMOS3_UND_TOWER` across a run keeps it on the GPU and gives back the entire gain (measured 34.4
+GB, i.e. the bundled figure).
 
 Costs: the conditioning carries `num_layers × 2 × L_text × H_kv × head_dim` elements on the sampling
 device (36 × 2 × 300 × 8 × 128 × 2 B ≈ 44 MB for a 300-token prompt at the shape above), one set per
@@ -267,11 +275,15 @@ weights — instead of by the sum.
 
 The last column is weight bytes, read from each checkpoint's tensor headers, not a runtime figure
 like RAM: the loaded total, then what each half holds under
-[`split_reasoner`](#splitting-the-reasoner). The denoiser holds the **gen** half for the whole run;
-the **und** half is loaded first and released, so it — the larger of the two, 51–60 % depending on
-model and format — is what bounds peak memory. RAM and Min VRAM are bundled-path measurements and
-are not re-stated for the split, which was measured with a different instrument. Nano, same clip and
-step count, through the nodes:
+[`split_reasoner`](#splitting-the-reasoner). The denoiser holds only the **gen** half for the whole
+run, which is what the GPU has to stream; the **und** half is a one-shot cost.
+
+**The RAM column does not improve.** `Cosmos3 Loader` supplies the tokenizer, so it necessarily runs
+before `Cosmos3 Text Encode` — the denoiser's weights are already staged in host RAM when the
+reasoner loads, and both halves are resident at the peak. Measured on Nano bf16: 31.89 GB bundled
+against 31.30 GB split, matching `12.98 + 14.10 + staging`. Releasing the reasoner afterwards does
+not help, because the peak has already passed. What the split buys is VRAM and the size of the model
+being streamed each step. Nano, same clip and step count, through the nodes:
 
 | Format | Sampled model | Peak VRAM | Time |
 |---|---|---|---|
