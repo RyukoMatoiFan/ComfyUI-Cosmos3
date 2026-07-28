@@ -256,7 +256,11 @@ class Cosmos3TextEncode:
             compute_dtype = und_tower.model.get_dtype()
             if compute_dtype not in (torch.float32, torch.float16, torch.bfloat16):
                 compute_dtype = torch.bfloat16
-            with torch.no_grad():
+            # inference_mode, not no_grad: quantized weights are tensor subclasses
+            # whose dispatch differs between the two, and the sampler runs under
+            # inference_mode. Prefilling under anything else gives an int4 tower
+            # K/V that the denoiser was not trained against.
+            with torch.inference_mode():
                 extras["cosmos3_und_kv"] = transformer.prefill_und_packed(
                     ids, compute_dtype=compute_dtype
                 )

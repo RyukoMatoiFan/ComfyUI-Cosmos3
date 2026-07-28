@@ -201,16 +201,15 @@ Verified on H100 against a 36-layer, hidden 4096 checkpoint, 832×480×93, 35 st
 Both halves load with no missing keys in every weight format tried, and the reasoner's per-layer K/V
 are bitwise identical whether produced by the bundled model or by a separately-loaded und tower.
 
-| format | denoised latent, bundled vs split |
-|---|---|
-| bf16 | bitwise identical over the full 35 steps |
-| int8 | bitwise identical over the full 35 steps |
-| int4 / ConvRot | identical for a single forward and for one sampler step; **diverges from the second step on** |
+The denoised latent is **bitwise identical** between the bundled and split paths in bf16, int8 and
+int4/ConvRot alike (`torch.equal` True in all three).
 
-**int4 is not yet equivalent under the split path.** The cause is not the reasoner: its K/V match
-bitwise, and the first denoising step matches bitwise, so the divergence appears only once the
-sampler iterates. Until that is resolved, use `split_reasoner` with bf16 or int8, and expect a
-different (not necessarily worse) result from int4.
+Quantized weights make this sharper than it sounds. They are tensor subclasses, and their dispatch
+differs between `torch.inference_mode()` and `torch.no_grad()` — under one the ConvRot Hadamard
+rotation is undone before the matmul, under the other it is not. Sampling runs under
+`inference_mode`, so `Cosmos3 Text Encode` prefills under it too. Prefilling under `no_grad` instead
+silently yields int4 K/V that do not match what the denoiser sees, with bf16 and int8 unaffected
+because only ConvRot carries a rotation.
 
 The partition covers the Nano/Super and Edge backbones, with and without the audio branch.
 
@@ -272,12 +271,12 @@ Nano, same clip and step count, measured through the nodes:
 
 | Format | Sampled model | Peak VRAM | Time |
 |---|---|---|---|
-| bf16 — bundled | 27.07 GB | 33.3 GB | 39.5 s |
-| bf16 — split | 12.98 GB | 19.3 GB | 36.9 s |
-| int8 — bundled | 14.15 GB | 20.4 GB | 48.7 s |
-| int8 — split | 6.51 GB | 12.8 GB | 44.5 s |
-| int4 — bundled | 10.34 GB | 16.6 GB | 48.2 s |
-| int4 — split | 4.61 GB | 10.9 GB | 44.4 s |
+| bf16 — bundled | 27.07 GB | 33.3 GB | 40.0 s |
+| bf16 — split | 12.98 GB | 19.3 GB | 36.6 s |
+| int8 — bundled | 14.15 GB | 20.4 GB | 49.3 s |
+| int8 — split | 6.51 GB | 12.8 GB | 45.1 s |
+| int4 — bundled | 10.34 GB | 16.6 GB | 47.6 s |
+| int4 — split | 4.61 GB | 10.9 GB | 44.5 s |
 
 **Sampled model** is what the denoiser holds: the gen half alone under split, so it drops by the und
 share. The und tower (5.7 GB int4 to 14.1 GB bf16) is loaded before it and released, which is why
