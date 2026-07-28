@@ -59,7 +59,7 @@ recommended there.
 | Node | Purpose · key inputs → outputs |
 |------|--------------------------------|
 | **Cosmos3 Loader** | Load the model. `weight_dtype` = `default` (bf16), `fp8_e4m3fn`, or `int8` (on-the-fly ComfyUI-native int8). Pre-quantized checkpoints (see [Quantized weights](#quantized-weights)) are auto-detected from their metadata — load those with `default`. `split_reasoner` loads only the generator half (see [Splitting the reasoner](#splitting-the-reasoner)). → `MODEL`, `COSMOS3_TEXT_ENCODER`, `VAE`, `COSMOS3_AUDIO_VAE` (empty on checkpoints without audio) |
-| **Cosmos3 Und Tower Loader** | Optional. Loads only the understanding tower ("reasoner") from the same `model_dir`, so it can be prefilled once and unloaded. → `COSMOS3_UND_TOWER` |
+| **Cosmos3 Und Tower Loader** | Optional. Points at the same `model_dir` and returns a handle to the understanding tower ("reasoner"); it reads nothing itself, and Text Encode streams the tower a layer at a time. → `COSMOS3_UND_TOWER` |
 | **Cosmos3 Text Encode** | Tokenize a prompt (chat template + optional resolution/duration metadata). Set `width`/`height`/`num_frames`/`fps` to match the latent. Connect `und_tower` to run the reasoner here instead of inside the model. → `CONDITIONING` |
 | **Cosmos3 Default Negative Prompt** | Returns the checkpoint's bundled `assets/negative_prompt.json` as a STRING — wire into a negative Text Encode. Returns an empty string when the checkpoint ships no such file. → `STRING` |
 | **Cosmos3 Empty Latent Video** | Zero latent `[B, 48, (length-1)//4+1, H/16, W/16]`. → `LATENT` |
@@ -188,17 +188,35 @@ and `gen/` trees if you also want the disk and download halved; it imports the s
 (`cosmos3/towers.py`) the loader uses, and carries per-layer quantization metadata with its tensors,
 so int8 and int4/ConvRot checkpoints split unchanged.
 
-The saving is in VRAM, not host RAM. Measured on Nano, 832×480×93: peak VRAM 34.4 → 20.2 GB in
-bf16 and 16.8 → 11.8 GB in int4, with sampling a few percent faster because a smaller model streams
-per step. Host RAM is unchanged — `Cosmos3 Loader` provides the tokenizer and so must run before
-`Cosmos3 Text Encode`, which leaves the denoiser's weights staged in host RAM while the reasoner
-loads, putting both halves resident at the peak (31.89 → 31.30 GB in bf16).
+`Cosmos3 Loader` supplies the tokenizer, so ComfyUI necessarily runs it before `Cosmos3 Text
+Encode`: by the time the reasoner is asked for, the denoiser's weights are already staged. Loading
+the tower whole at that point would put both halves resident and cancel the saving. It is therefore
+never loaded whole — `Cosmos3 Und Tower Loader` returns a handle that reads nothing, and the prefill
+streams the tower a layer at a time, since `forward_und` needs only layer *i*'s weights and the
+running hidden state. Peak reasoner cost is one layer plus the token embedding.
 
-Two consequences follow. If host RAM is the binding constraint, this feature does not help — reach
-for a [quantized checkpoint](#quantized-weights) instead. And the VRAM saving only materialises if
-the reasoner is released after the prefill: ComfyUI caches node outputs, so holding onto the
-`COSMOS3_UND_TOWER` across a run keeps it on the GPU and gives back the entire gain (measured 34.4
-GB, i.e. the bundled figure).
+Measured on Nano, 832×480×93, 35 steps, three repeats per row (VRAM identical across repeats; RSS
+within 0.10 GB):
+
+| Format | Sampled model | Peak VRAM | Peak RSS | of which anonymous |
+|---|---|---|---|---|
+| bf16 — bundled | 27.07 GB | 33.34 GB | 31.89 GB | 29.10 GB |
+| bf16 — split | 12.98 GB | **19.26 GB** | 29.85 GB | **15.34 GB** |
+| int8 — bundled | 14.15 GB | 20.41 GB | 16.54 GB | 3.20 GB |
+| int8 — split | 6.51 GB | **12.77 GB** | **10.42 GB** | 2.53 GB |
+| int4 — bundled | 10.34 GB | 16.61 GB | 14.56 GB | 5.07 GB |
+| int4 — split | 4.61 GB | **10.88 GB** | **10.00 GB** | 3.22 GB |
+
+**VRAM is the dependable win: 34–42 % across all three formats.** Host RAM improves too, but which
+number moves depends on the format, so read both columns. Streaming the reasoner reads it through
+`mmap`, and those pages are file-backed — resident, counted in RSS, but reclaimable without swap, so
+they are not a hard requirement. In bf16 the anonymous requirement halves (29.10 → 15.34 GB) while
+total RSS barely moves; in int8/int4 total RSS drops 4.6–6.1 GB while the anonymous figure was
+already low, because quantized weights stay mmap-backed even in the bundled path (int8 bundled holds
+14.15 GB of weights against 3.20 GB anonymous).
+
+Sampling is also 3–4 s faster per clip, consistently across repeats, because a smaller model streams
+each step.
 
 Costs: the conditioning carries `num_layers × 2 × L_text × H_kv × head_dim` elements on the sampling
 device (36 × 2 × 300 × 8 × 128 × 2 B ≈ 44 MB for a 300-token prompt at the shape above), one set per
@@ -268,37 +286,16 @@ decode at the step count shown.
 | | int8 | 67 GB | | 20 s | 59.67 → 30.53 / 29.14 GB |
 | | int4 | 63 GB | | 16 s | 42.06 → 21.73 / 20.33 GB |
 
-The table is with the reasoner bundled (the default). With
-[`split_reasoner`](#splitting-the-reasoner) the und parameters are never constructed in the sampled
-model, and peak host memory is set by whichever half is larger — the und tower, at 52.1 % of the
-weights — instead of by the sum.
+The table is with the reasoner bundled (the default). The last column is weight bytes, read from
+each checkpoint's tensor headers rather than measured: the loaded total, then what each half holds
+under [`split_reasoner`](#splitting-the-reasoner). The denoiser holds only the **gen** half for the
+whole run; the **und** half is a one-shot cost, streamed a layer at a time.
 
-The last column is weight bytes, read from each checkpoint's tensor headers, not a runtime figure
-like RAM: the loaded total, then what each half holds under
-[`split_reasoner`](#splitting-the-reasoner). The denoiser holds only the **gen** half for the whole
-run, which is what the GPU has to stream; the **und** half is a one-shot cost.
+The RAM and Min VRAM columns are bundled-path measurements and are not re-stated for the split. What
+the split does to memory, measured over three repeats with its own instrument, is in
+[Splitting the reasoner](#splitting-the-reasoner). Only Nano was measured there; Super and Edge have
+weight sizes above but no split runtime figures.
 
-**The RAM column does not improve.** `Cosmos3 Loader` supplies the tokenizer, so it necessarily runs
-before `Cosmos3 Text Encode` — the denoiser's weights are already staged in host RAM when the
-reasoner loads, and both halves are resident at the peak. Measured on Nano bf16: 31.89 GB bundled
-against 31.30 GB split, matching `12.98 + 14.10 + staging`. Releasing the reasoner afterwards does
-not help, because the peak has already passed. What the split buys is VRAM and the size of the model
-being streamed each step. Nano, same clip and step count, through the nodes:
-
-| Format | Sampled model | Peak VRAM | Time |
-|---|---|---|---|
-| bf16 — bundled | 27.07 GB | 33.3 GB | 40.0 s |
-| bf16 — split | 12.98 GB | 19.3 GB | 36.6 s |
-| int8 — bundled | 14.15 GB | 20.4 GB | 49.3 s |
-| int8 — split | 6.51 GB | 12.8 GB | 45.1 s |
-| int4 — bundled | 10.34 GB | 16.6 GB | 47.6 s |
-| int4 — split | 4.61 GB | 10.9 GB | 44.5 s |
-
-**Sampled model** is what the denoiser holds: the gen half alone under split, so it drops by the und
-share. The und tower (5.7 GB int4 to 14.1 GB bf16) is loaded before it and released, which is why
-peak, not the sampled size, is what a host has to accommodate. Peak VRAM falls too, because a
-smaller model streams less. Sampling is a little faster for the same reason, though the prefill
-itself runs once per prompt in both modes. Super was not part of this run.
 
 RAM and VRAM trade off: these are at the minimum VRAM (maximum streaming); giving the GPU more VRAM
 holds more weights on-card, which lowers the RAM figure and speeds sampling. bf16 host RAM peaks near

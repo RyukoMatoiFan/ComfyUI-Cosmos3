@@ -484,6 +484,75 @@ class Cosmos3TimestepEmbedding(nn.Module):
 # Main transformer
 # ---------------------------------------------------------------------------
 
+class Cosmos3UndPrefiller(nn.Module):
+    """
+    The understanding tower, one layer deep.
+
+    `forward_und` is sequential: layer i needs only layer i's weights and the
+    running hidden state, so the prefill never requires the whole tower in
+    memory. This holds a single reusable decoder layer; the caller fills it with
+    layer i's weights, calls :meth:`run_layer`, and frees them again. Peak cost
+    is one layer plus the embedding rather than the entire und half — which is
+    what keeps the split from doubling host RAM, since ComfyUI has already
+    staged the denoiser's weights by the time the reasoner is asked for.
+
+    Produces exactly what Cosmos3OmniTransformer._und_prefill produces; the
+    arithmetic is identical, only the residency differs.
+    """
+
+    def __init__(self, hidden_size, num_hidden_layers, num_attention_heads,
+                 num_key_value_heads, head_dim, intermediate_size, vocab_size,
+                 rope_theta=5000000.0, mrope_section=(24, 20, 20), rope_scaling=None,
+                 rms_norm_eps=1e-6, hidden_act=None, qk_norm_for_text=True,
+                 use_und_k_norm_for_gen=False,
+                 device=None, dtype=None, operations=None, **kwargs):
+        super().__init__()
+        if rope_scaling is not None and "mrope_section" in rope_scaling:
+            mrope_section = tuple(rope_scaling["mrope_section"])
+        self.num_hidden_layers = num_hidden_layers
+
+        gated_mlp = (hidden_act or "silu") != "relu2"
+        nemotron_norm = (hidden_act == "relu2")
+
+        self.embed_tokens = operations.Embedding(vocab_size, hidden_size,
+                                                 device=device, dtype=dtype)
+        self.layer = Cosmos3DecoderLayer(
+            hidden_size=hidden_size, head_dim=head_dim,
+            num_attention_heads=num_attention_heads,
+            num_key_value_heads=num_key_value_heads,
+            intermediate_size=intermediate_size, rms_norm_eps=rms_norm_eps,
+            gated_mlp=gated_mlp, qk_norm_for_text=qk_norm_for_text,
+            use_und_k_norm_for_gen=use_und_k_norm_for_gen,
+            nemotron_norm=nemotron_norm, build_und=True, build_gen=False,
+            device=device, dtype=dtype, operations=operations,
+        )
+        self.rotary_emb = Cosmos3RotaryEmbedding(
+            head_dim=head_dim, rope_theta=rope_theta, rope_axes_dim=mrope_section,
+        )
+
+    def begin(self, token_ids, compute_dtype):
+        """Embed the prompt and build the text RoPE tables. Returns hidden state."""
+        device = token_ids.device
+        text_mrope_ids, _ = _get_mrope_ids_text(token_ids.shape[0], temporal_offset=0)
+        cos, sin = self.rotary_emb(
+            position_ids=text_mrope_ids.to(device), device=device, dtype=compute_dtype
+        )
+        self._cos = cos.squeeze(0)
+        self._sin = sin.squeeze(0)
+        return self.embed_tokens(token_ids).to(compute_dtype)
+
+    def run_layer(self, und_seq):
+        """Advance one layer. Returns (und_seq_next, k_und, v_und)."""
+        return self.layer.forward_und(und_seq, self._cos, self._sin)
+
+    @staticmethod
+    def pack(und_kv):
+        """Stack per-layer K/V the way the conditioning carries them."""
+        return torch.stack(
+            [torch.stack((k, v), dim=0) for k, v in und_kv], dim=0
+        ).unsqueeze(0)
+
+
 class Cosmos3OmniTransformer(nn.Module):
     """
     ComfyUI port of the diffusers Cosmos3OmniTransformer (video + audio).

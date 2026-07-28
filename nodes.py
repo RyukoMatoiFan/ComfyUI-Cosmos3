@@ -31,6 +31,11 @@ def _get_und_tower_loader():
     return load_cosmos3_und_tower
 
 
+def _get_stream_prefill():
+    from .cosmos3.loader import stream_und_prefill
+    return stream_und_prefill
+
+
 def _resolve_model_dir(model_dir: str) -> str:
     """Resolve a bare directory name against the registered cosmos3 folders."""
     if not os.path.isabs(model_dir) or not os.path.isdir(model_dir):
@@ -133,9 +138,12 @@ class Cosmos3UndTowerLoader:
     denoising step — it can run once, like a text encoder, and then be offloaded.
 
     Feed this into Cosmos3 Text Encode and set split_reasoner on the loader that
-    provides the MODEL. The denoiser then holds only the gen half on the GPU,
-    which is where the saving is; host RAM is unchanged, since the main loader
-    runs first and both halves are staged there by the time this one loads.
+    provides the MODEL. The denoiser then holds only the gen half.
+
+    This node reads nothing: it returns a handle, and Cosmos3 Text Encode streams
+    the tower a layer at a time. Loading it whole would put both halves in host
+    RAM at once, because ComfyUI runs the loader that supplies the tokenizer
+    before the text encode.
 
     Point it at the same model_dir as the main loader; no separate download is
     needed, the other half's tensors are skipped as the shards stream past.
@@ -247,24 +255,17 @@ class Cosmos3TextEncode:
         extras = {"cosmos3_fps": float(fps)}
 
         if und_tower is not None:
-            # Run the reasoner once, here. ComfyUI then offloads it before the
-            # sampler loads the generator half, so the two never share VRAM.
-            comfy.model_management.load_model_gpu(und_tower)
-            device = und_tower.load_device
-            transformer = und_tower.model.diffusion_model
+            # Run the reasoner once, here, one layer at a time — see
+            # stream_und_prefill for why it is not loaded whole.
+            device = comfy.model_management.get_torch_device()
             ids = torch.tensor(token_ids, dtype=torch.long, device=device)
-            # Compute dtype, not storage dtype: fp8/quantized weights have no
-            # matmul kernel and are cast up to bf16 for the actual math.
-            compute_dtype = und_tower.model.get_dtype()
-            if compute_dtype not in (torch.float32, torch.float16, torch.bfloat16):
-                compute_dtype = torch.bfloat16
             # inference_mode, not no_grad: quantized weights are tensor subclasses
             # whose dispatch differs between the two, and the sampler runs under
             # inference_mode. Prefilling under anything else gives an int4 tower
             # K/V that the denoiser was not trained against.
             with torch.inference_mode():
-                extras["cosmos3_und_kv"] = transformer.prefill_und_packed(
-                    ids, compute_dtype=compute_dtype
+                extras["cosmos3_und_kv"] = _get_stream_prefill()(
+                    und_tower, ids, device, compute_dtype=torch.bfloat16
                 )
 
         conditioning = [[ids_tensor, extras]]

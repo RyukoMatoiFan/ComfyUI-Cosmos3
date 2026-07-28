@@ -122,6 +122,125 @@ def _load_transformer_config(transformer_dir: str) -> Dict:
 
 
 # ---------------------------------------------------------------------------
+# Quantized-op registration (global, idempotent)
+# ---------------------------------------------------------------------------
+
+def _register_awq_ops():
+    """Teach comfy about our int4 format and route both quant layouts through a
+    deterministic dequantize-then-bf16 matmul.
+
+    awq_w4a16 (our int4 MLP format) isn't in comfy's QUANT_ALGOS. Register it so the
+    mixed-precision Linear forward treats it as weight-only (quantize_input=False)
+    instead of defaulting to True and trying to quantize activations — AWQ.quantize is
+    offline-only and would raise. The load itself is handled by our own construction
+    in _build_awq (comfy's _load_quantized_module has no awq branch).
+    """
+    import comfy.quant_ops as _qops
+    if "awq_w4a16" in _qops.QUANT_ALGOS:
+        return
+    _qops.QUANT_ALGOS["awq_w4a16"] = {
+        "storage_t": torch.int8,
+        "parameters": {"weight_scale", "weight_zeros"},
+        "comfy_tensor_layout": "TensorCoreAWQW4A16Layout",
+        "quantize_input": False,
+    }
+    # comfy_kitchen's AWQ layout dispatches F.linear to its gemv_awq_w4a16 kernel,
+    # which produces wrong output for large weight shapes. Re-register linear/mm/addmm
+    # to dequantize-then-run instead — correct, and still streams the packed int4
+    # weight (dequant happens per-forward). Global but only affects AWQ.
+    # Route int8_tensorwise the same way: its int8 GEMM uses non-deterministic atomics,
+    # which jitters the denoising trajectory frame-to-frame. A dequantize-then-bf16
+    # matmul is deterministic, so the quantized model tracks the plain-bf16 trajectory.
+    # Both formats are weight-only, so this only changes the matmul kernel, not the
+    # numerics beyond determinism.
+    from comfy_kitchen.tensor.base import (
+        register_layout_op as _rlo, dequantize_args as _dqa, QuantizedTensor as _QTb,
+    )
+    from comfy_kitchen.tensor.awq_w4a16 import TensorCoreAWQW4A16Layout as _AWQL
+    from comfy_kitchen.tensor.int8 import TensorWiseINT8Layout as _I8L
+
+    _hcache = {}
+    def _hmat(n, device, dtype):
+        key = (n, device, dtype)
+        if key not in _hcache:
+            H = torch.ones(1, 1, device=device, dtype=torch.float32)
+            while H.shape[0] < n:
+                H = torch.cat([torch.cat([H, H], 1), torch.cat([H, -H], 1)], 0)
+            _hcache[key] = (H / (n ** 0.5)).to(dtype)
+        return _hcache[key]
+
+    def _deq_int8(op):
+        def _h(_qt, args, kwargs):
+            return op(*_dqa(args), **_dqa(kwargs))
+        return _h
+
+    def _deq_awq(op):
+        # Dequantize the AWQ int4 weight, then undo the pack-time Hadamard rotation
+        # (per group of group_size). Our int4 MLPs are always ConvRot-rotated.
+        def _h(_qt, args, kwargs):
+            new = []
+            for a in args:
+                if isinstance(a, _QTb) and getattr(a, "_layout_cls", None) == "TensorCoreAWQW4A16Layout":
+                    w = a.dequantize()
+                    g = int(getattr(a._params, "group_size", 32))
+                    o, i = w.shape
+                    w = (w.reshape(o, i // g, g) @ _hmat(g, w.device, w.dtype)).reshape(o, i)
+                    new.append(w)
+                else:
+                    new.append(_dqa(a))
+            return op(*new, **_dqa(kwargs))
+        return _h
+
+    for _op in (torch.ops.aten.linear.default, torch.ops.aten.mm.default,
+                torch.ops.aten.addmm.default):
+        _rlo(_op, _AWQL)(_deq_awq(_op))
+        _rlo(_op, _I8L)(_deq_int8(_op))
+
+
+def _pop_awq(quant_sd):
+    """Remove awq_w4a16 layers from a state dict, returning their parts by module."""
+    awq = {}
+    for k in [k for k in quant_sd if k.endswith(".comfy_quant")]:
+        conf = json.loads(bytes(quant_sd[k].tolist()).decode("utf-8"))
+        if conf.get("format") != "awq_w4a16":
+            continue
+        base = k[: -len(".comfy_quant")]
+        awq[base] = {
+            "qweight": quant_sd.pop(base + ".weight"),
+            "scale": quant_sd.pop(base + ".weight_scale"),
+            "zeros": quant_sd.pop(base + ".weight_zeros"),
+            "group_size": int(conf.get("group_size", 32)),
+            "orig_shape": tuple(conf.get("orig_shape")),
+        }
+        del quant_sd[k]
+    return awq
+
+
+def _build_awq(target, awq, device):
+    """Attach awq_w4a16 QuantizedTensors, mirroring comfy's own construction."""
+    if not awq:
+        return
+    from comfy_kitchen.tensor.awq_w4a16 import TensorCoreAWQW4A16Layout as _AWQ
+    from comfy_kitchen.tensor.base import QuantizedTensor as _QT
+    for base, p in awq.items():
+        mod = target.get_submodule(base)
+        params = _AWQ.Params(
+            scale=p["scale"].to(device),
+            zeros=p["zeros"].to(device),
+            group_size=p["group_size"],
+            orig_dtype=torch.bfloat16,
+            orig_shape=p["orig_shape"],
+        )
+        qt = _QT(p["qweight"].to(device), "TensorCoreAWQW4A16Layout", params)
+        mod.weight = torch.nn.Parameter(qt, requires_grad=False)
+        # Mirror the attributes comfy's own _load_quantized_module sets, so the
+        # module behaves like a natively-loaded quantized layer (forward + state_dict).
+        mod.quant_format = "awq_w4a16"
+        mod.layout_type = "TensorCoreAWQW4A16Layout"
+        mod._full_precision_mm_config = False
+
+
+# ---------------------------------------------------------------------------
 # load_cosmos3_model
 # ---------------------------------------------------------------------------
 
@@ -194,69 +313,7 @@ def load_cosmos3_model(
         model_config.custom_operations = comfy.ops.mixed_precision_ops(
             quant_config, torch.bfloat16
         )
-        # awq_w4a16 (our int4 MLP format) isn't in comfy's QUANT_ALGOS. Register it so the
-        # mixed-precision Linear forward treats it as weight-only (quantize_input=False)
-        # instead of defaulting to True and trying to quantize activations — AWQ.quantize is
-        # offline-only and would raise. The load itself is handled by our own construction
-        # below (comfy's _load_quantized_module has no awq branch).
-        import comfy.quant_ops as _qops
-        if "awq_w4a16" not in _qops.QUANT_ALGOS:
-            _qops.QUANT_ALGOS["awq_w4a16"] = {
-                "storage_t": torch.int8,
-                "parameters": {"weight_scale", "weight_zeros"},
-                "comfy_tensor_layout": "TensorCoreAWQW4A16Layout",
-                "quantize_input": False,
-            }
-            # comfy_kitchen's AWQ layout dispatches F.linear to its gemv_awq_w4a16 kernel,
-            # which produces wrong output for large weight shapes. Re-register linear/mm/addmm
-            # to dequantize-then-run instead — correct, and still streams the packed int4
-            # weight (dequant happens per-forward). Global but only affects AWQ.
-            # Route int8_tensorwise the same way: its int8 GEMM uses non-deterministic atomics,
-            # which jitters the denoising trajectory frame-to-frame. A dequantize-then-bf16
-            # matmul is deterministic, so the quantized model tracks the plain-bf16 trajectory.
-            # Both formats are weight-only, so this only changes the matmul kernel, not the
-            # numerics beyond determinism.
-            from comfy_kitchen.tensor.base import (
-                register_layout_op as _rlo, dequantize_args as _dqa, QuantizedTensor as _QTb,
-            )
-            from comfy_kitchen.tensor.awq_w4a16 import TensorCoreAWQW4A16Layout as _AWQL
-            from comfy_kitchen.tensor.int8 import TensorWiseINT8Layout as _I8L
-
-            _hcache = {}
-            def _hmat(n, device, dtype):
-                key = (n, device, dtype)
-                if key not in _hcache:
-                    H = torch.ones(1, 1, device=device, dtype=torch.float32)
-                    while H.shape[0] < n:
-                        H = torch.cat([torch.cat([H, H], 1), torch.cat([H, -H], 1)], 0)
-                    _hcache[key] = (H / (n ** 0.5)).to(dtype)
-                return _hcache[key]
-
-            def _deq_int8(op):
-                def _h(_qt, args, kwargs):
-                    return op(*_dqa(args), **_dqa(kwargs))
-                return _h
-
-            def _deq_awq(op):
-                # Dequantize the AWQ int4 weight, then undo the pack-time Hadamard rotation
-                # (per group of group_size). Our int4 MLPs are always ConvRot-rotated.
-                def _h(_qt, args, kwargs):
-                    new = []
-                    for a in args:
-                        if isinstance(a, _QTb) and getattr(a, "_layout_cls", None) == "TensorCoreAWQW4A16Layout":
-                            w = a.dequantize()
-                            g = int(getattr(a._params, "group_size", 32))
-                            o, i = w.shape
-                            w = (w.reshape(o, i // g, g) @ _hmat(g, w.device, w.dtype)).reshape(o, i)
-                            new.append(w)
-                        else:
-                            new.append(_dqa(a))
-                    return op(*new, **_dqa(kwargs))
-                return _h
-            for _op in (torch.ops.aten.linear.default, torch.ops.aten.mm.default,
-                        torch.ops.aten.addmm.default):
-                _rlo(_op, _AWQL)(_deq_awq(_op))
-                _rlo(_op, _I8L)(_deq_int8(_op))
+        _register_awq_ops()
 
     offload_device = comfy.model_management.unet_offload_device()
     load_device = comfy.model_management.get_torch_device()
@@ -337,44 +394,14 @@ def load_cosmos3_model(
         # AWQ int4 (awq_w4a16) layers: comfy's native _load_quantized_module doesn't know
         # this format, so pop their parts and build the QuantizedTensor here (int8_tensorwise
         # and bf16 layers load natively below). Mirrors comfy's own QuantizedTensor construction.
-        awq = {}
-        for k in [k for k in quant_sd if k.endswith(".comfy_quant")]:
-            conf = json.loads(bytes(quant_sd[k].tolist()).decode("utf-8"))
-            if conf.get("format") != "awq_w4a16":
-                continue
-            base = k[: -len(".comfy_quant")]
-            awq[base] = {
-                "qweight": quant_sd.pop(base + ".weight"),
-                "scale": quant_sd.pop(base + ".weight_scale"),
-                "zeros": quant_sd.pop(base + ".weight_zeros"),
-                "group_size": int(conf.get("group_size", 32)),
-                "orig_shape": tuple(conf.get("orig_shape")),
-            }
-            del quant_sd[k]
+        awq = _pop_awq(quant_sd)
         _, unexpected = target.load_state_dict(quant_sd, strict=False)
         loaded.update(k for k in quant_sd if k in expected)
         unexpected_all.extend(unexpected)
         del quant_sd
+        _build_awq(target, awq, offload_device)
         if awq:
-            from comfy_kitchen.tensor.awq_w4a16 import TensorCoreAWQW4A16Layout as _AWQ
-            from comfy_kitchen.tensor.base import QuantizedTensor as _QT
-            for base, p in awq.items():
-                mod = target.get_submodule(base)
-                params = _AWQ.Params(
-                    scale=p["scale"].to(offload_device),
-                    zeros=p["zeros"].to(offload_device),
-                    group_size=p["group_size"],
-                    orig_dtype=torch.bfloat16,
-                    orig_shape=p["orig_shape"],
-                )
-                qt = _QT(p["qweight"].to(offload_device), "TensorCoreAWQW4A16Layout", params)
-                mod.weight = torch.nn.Parameter(qt, requires_grad=False)
-                # Mirror the attributes comfy's own _load_quantized_module sets, so the
-                # module behaves like a natively-loaded quantized layer (forward + state_dict).
-                mod.quant_format = "awq_w4a16"
-                mod.layout_type = "TensorCoreAWQW4A16Layout"
-                mod._full_precision_mm_config = False
-                loaded.add(base + ".weight")
+            loaded.update(base + ".weight" for base in awq)
             logger.info("Built %d AWQ int4 (awq_w4a16) layers", len(awq))
         del awq
 
@@ -416,19 +443,138 @@ def load_cosmos3_model(
     return patcher
 
 
-def load_cosmos3_und_tower(
-    model_dir: str,
-    weight_dtype: str = "default",
-) -> comfy.model_patcher.ModelPatcher:
+def load_cosmos3_und_tower(model_dir: str, weight_dtype: str = "default") -> dict:
     """
-    Load only the understanding tower — the reasoner that turns text tokens into
-    the per-layer K/V the denoiser attends over.
+    Describe the understanding tower without reading any of it.
 
-    Wrapped in a ModelPatcher so ComfyUI loads it for the one prefill and then
-    offloads it, exactly as it treats a text encoder. Point this at the same
-    checkpoint directory as the generator half.
+    Materializing the tower here would defeat the purpose: ComfyUI runs the
+    loader that supplies the tokenizer before the text encode, so the denoiser's
+    weights are already staged in host RAM by this point, and a fully-loaded
+    tower would put both halves resident at once. Instead this returns a handle
+    and :func:`stream_und_prefill` reads one layer at a time.
     """
-    return load_cosmos3_model(model_dir, weight_dtype, tower="und")
+    transformer_dir = os.path.join(model_dir, "transformer")
+    unet_config = _load_transformer_config(transformer_dir)
+    shard_paths = resolve_shard_files(transformer_dir)
+    from safetensors import safe_open
+    with safe_open(shard_paths[0], framework="pt", device="cpu") as f:
+        prequant = any(k.endswith(".comfy_quant") for k in f.keys())
+    return {
+        "transformer_dir": transformer_dir,
+        "unet_config": unet_config,
+        "weight_dtype": weight_dtype,
+        "prequant": prequant,
+        "shard_paths": shard_paths,
+    }
+
+
+def _und_weight_map(shard_paths):
+    """Map every key to the shard holding it, without reading tensor data."""
+    from safetensors import safe_open
+    out = {}
+    for path in shard_paths:
+        with safe_open(path, framework="pt", device="cpu") as f:
+            for k in f.keys():
+                out[k] = path
+    return out
+
+
+def stream_und_prefill(desc: dict, token_ids: torch.Tensor,
+                       device, compute_dtype=torch.bfloat16) -> torch.Tensor:
+    """
+    Run the understanding tower one layer at a time and return its packed K/V.
+
+    Only the layer being executed is resident, so the reasoner costs a single
+    layer plus the token embedding rather than the whole und half. Output is
+    identical to Cosmos3OmniTransformer._und_prefill on the same tokens.
+
+    Must be called under torch.inference_mode(): quantized weights are tensor
+    subclasses whose dispatch differs from no_grad, and the denoiser runs under
+    inference_mode.
+    """
+    from .model import Cosmos3UndPrefiller
+    from safetensors import safe_open
+
+    weight_dtype = desc["weight_dtype"]
+    prequant = desc["prequant"]
+    unet_config = dict(desc["unet_config"])
+
+    if weight_dtype == "fp8_e4m3fn" and not prequant:
+        build_dtype = torch.float8_e4m3fn
+        operations = comfy.ops.manual_cast
+    elif weight_dtype == "int8" or prequant:
+        build_dtype = torch.bfloat16
+        _register_awq_ops()
+        operations = comfy.ops.mixed_precision_ops({"mixed_ops": True}, torch.bfloat16)
+    else:
+        build_dtype = torch.bfloat16
+        operations = comfy.ops.disable_weight_init
+
+    prefiller = Cosmos3UndPrefiller(
+        device=device, dtype=build_dtype, operations=operations, **unet_config
+    )
+    quantized = (weight_dtype == "int8" or prequant)
+    # Only und keys are ever fetched; the gen half's tensors are never touched.
+    weight_map = {k: p for k, p in _und_weight_map(desc["shard_paths"]).items()
+                  if not is_dropped_key(k) and is_und_key(k)}
+    handles = {p: safe_open(p, framework="pt", device="cpu").__enter__()
+               for p in set(weight_map.values())}
+
+    def fetch(key):
+        return handles[weight_map[key]].get_tensor(key)
+
+    def fill(module, prefix):
+        """Load one module's weights from the checkpoint into `module`."""
+        sd = {k[len(prefix):]: fetch(k) for k in weight_map if k.startswith(prefix)}
+        if weight_dtype == "fp8_e4m3fn" and not prequant:
+            sd = {k: (v.to(torch.float8_e4m3fn) if not _should_skip_fp8(k, v) else v)
+                  for k, v in sd.items()}
+        elif weight_dtype == "int8" and not prequant:
+            names = {n + ".weight" for n, m in module.named_modules()
+                     if isinstance(m, operations.Linear)}
+            out = {}
+            for k, v in sd.items():
+                if k in names and v.ndim == 2:
+                    w = v.to(device, dtype=torch.float32)
+                    scale = w.abs().amax(dim=1, keepdim=True).clamp(min=1e-30) / 127.0
+                    base = k[: -len(".weight")]
+                    out[k] = (w / scale).round().clamp(-128, 127).to(torch.int8).cpu()
+                    out[base + ".weight_scale"] = scale.cpu()
+                    out[base + ".comfy_quant"] = torch.tensor(
+                        list(json.dumps({"format": "int8_tensorwise"}).encode("utf-8")),
+                        dtype=torch.uint8,
+                    )
+                else:
+                    out[k] = v
+            sd = out
+        awq = _pop_awq(sd) if quantized else {}
+        missing, _ = module.load_state_dict(sd, strict=False)
+        if quantized:
+            _build_awq(module, awq, device)
+            missing = [m for m in missing if m[: -len(".weight")] not in awq]
+        if missing:
+            raise RuntimeError(
+                "Understanding tower is missing %d weights under %r (first: %s). The "
+                "checkpoint does not match transformer/config.json."
+                % (len(missing), prefix, missing[:3])
+            )
+
+    try:
+        fill(prefiller.embed_tokens, "embed_tokens.")
+        und_seq = prefiller.begin(token_ids, compute_dtype)
+        # embed_tokens is the largest single und tensor (vocab x hidden) and is
+        # finished with once the prompt is embedded — drop it before the layers.
+        prefiller.embed_tokens = torch.nn.Identity()
+
+        und_kv = []
+        for i in range(prefiller.num_hidden_layers):
+            fill(prefiller.layer, "layers.%d." % i)
+            und_seq, k_und, v_und = prefiller.run_layer(und_seq)
+            und_kv.append((k_und, v_und))
+        return Cosmos3UndPrefiller.pack(und_kv)
+    finally:
+        for h in handles.values():
+            h.__exit__(None, None, None)
 
 
 # ---------------------------------------------------------------------------
