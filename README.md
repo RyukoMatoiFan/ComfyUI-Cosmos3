@@ -197,20 +197,14 @@ device (36 × 2 × 300 × 8 × 128 × 2 B ≈ 44 MB for a 300-token prompt at th
 prompt, so CFG holds two. A LoRA patching und-side keys must be applied to the und tower's patcher;
 the `patches_uuid` cache invalidation in `model.py` covers only the bundled path.
 
-Verified on a 28.26 GB bf16 checkpoint (36 layers, hidden 4096), H100, single forward at 8×8×2
-latent, 16 text tokens:
+Verified on H100 against a 36-layer, hidden 4096 checkpoint in three weight formats — bf16, int8 and
+int4/ConvRot. In each, velocity output is **bitwise identical** between the bundled and split paths
+(`torch.equal` True, against reference magnitudes mean |v| 0.28–0.92), both halves load with no
+missing keys, and peak RSS does not rise when the generator is loaded after the reasoner is
+released, so the two halves are not resident together. Per-format memory figures are in
+[Measured footprint](#measured-footprint-h100-832480-93-frames).
 
-| | peak host RSS |
-|---|---|
-| bundled (`tower="both"`) | 32.04 GB |
-| split (und prefill, then `tower="gen"`) | 16.83 GB |
-
-RSS does not rise when the generator is loaded after the reasoner is released, so the two halves are
-not resident together. Velocity output is **bitwise identical** between the two paths (`torch.equal`
-True; reference magnitude mean |v| 0.92), and both halves load with no missing keys.
-
-The partition covers the Nano/Super and Edge backbones, with and without the audio branch. The
-measurements above are for the bf16 format.
+The partition covers the Nano/Super and Edge backbones, with and without the audio branch.
 
 ## Quantized weights
 
@@ -261,14 +255,21 @@ decode at the step count shown.
 
 The table is with the reasoner bundled (the default). With
 [`split_reasoner`](#splitting-the-reasoner) the und parameters are never constructed in the sampled
-model, so the RAM figure is bounded by the gen half rather than by both.
+model, and peak host memory is set by whichever half is larger — the und tower, at 52.1 % of the
+weights — instead of by the sum.
 
-No row above has been re-run split. The split was measured on its own, under lighter conditions — a
-single forward at an 8×8×2 latent with 16 text tokens on a 28.26 GB bf16 checkpoint — where peak RSS
-went 32.04 → 16.83 GB, a 47.5 % drop against a 47.9 % gen share of the loaded weights. Those absolute
-figures are not comparable to the rows above, which sample 35 steps at 832×480×93 and so carry a far
-larger activation and staging peak; only the ratio carries over. Scaling the rows by the gen share
-puts Super int4 near 33 GB and Nano int4 near 11 GB — arithmetic, not measurements. Min VRAM and time
+No row above has been re-run split. The split was measured separately, one forward per run, on Nano:
+
+| checkpoint | latent | bundled | split |
+|---|---|---|---|
+| bf16, 28.26 GB | 8×8×2 | 32.04 GB | 16.83 GB |
+| int8 | 832×480×93 | 15.05 GB | 8.37 GB |
+| int4 | 832×480×93 | 13.20 GB | 7.57 GB |
+
+In each case peak RSS was reached while loading the und tower and did not rise when the generator
+was loaded afterwards. These absolute figures are not comparable to the rows above, which sample 35
+steps and then VAE-decode; what carries over is that peak falls by roughly the size of the und half,
+so the Super rows would drop by tens of GB. Super itself was not part of the run. Min VRAM and time
 are unaffected in either mode: the prefill runs once per prompt in both.
 
 RAM and VRAM trade off: these are at the minimum VRAM (maximum streaming); giving the GPU more VRAM
