@@ -209,11 +209,17 @@ within 0.10 GB):
 
 **VRAM is the dependable win: 34–42 % across all three formats.** Host RAM improves too, but which
 number moves depends on the format, so read both columns. Streaming the reasoner reads it through
-`mmap`, and those pages are file-backed — resident, counted in RSS, but reclaimable without swap, so
-they are not a hard requirement. In bf16 the anonymous requirement halves (29.10 → 15.34 GB) while
-total RSS barely moves; in int8/int4 total RSS drops 4.6–6.1 GB while the anonymous figure was
+`mmap`, and those pages are file-backed: resident and counted in RSS, but clean, so the kernel drops
+them under pressure without swapping. In bf16 the anonymous requirement halves (29.10 → 15.34 GB)
+while total RSS barely moves; in int8/int4 total RSS drops 4.6–6.1 GB while the anonymous figure was
 already low, because quantized weights stay mmap-backed even in the bundled path (int8 bundled holds
 14.15 GB of weights against 3.20 GB anonymous).
+
+On an unconstrained host, treat the anonymous figure as the requirement. **Under a cgroup limit
+(Docker, Kubernetes) it is not that simple** — page cache counts against `memory.max`, and while
+these pages are highly reclaimable, reclaim is not guaranteed to win a race against the anonymous
+working set. If you run with a tight `memory.max`, size it against total RSS, not the anonymous
+figure.
 
 Sampling is also 3–4 s faster per clip, consistently across repeats, because a smaller model streams
 each step.
