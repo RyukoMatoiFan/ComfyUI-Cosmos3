@@ -1,7 +1,7 @@
 """
 cosmos3/model_base.py
 
-BaseModel subclass and model config for Cosmos3 Omni Nano.
+BaseModel subclass and model config for the Cosmos3 family.
 
   - Cosmos3ModelSampling: identity timestep mapping over a shifted flow schedule.
   - Cosmos3Omni(BaseModel): extra_conds for cross-attn, fps, I2V latent/mask, sound.
@@ -90,7 +90,7 @@ class Cosmos3ModelSampling(comfy.model_sampling.ModelSamplingDiscreteFlow, comfy
 
 class Cosmos3ModelConfig(comfy.supported_models_base.BASE):
     """
-    Model config for Cosmos3 Omni Nano.
+    Model config for Cosmos3.
 
     unet_config is empty {} — we create the model directly via get_model(),
     not via ComfyUI's automatic detection machinery.
@@ -135,7 +135,7 @@ class Cosmos3ModelConfig(comfy.supported_models_base.BASE):
 
 class Cosmos3Omni(comfy.model_base.BaseModel):
     """
-    ComfyUI BaseModel subclass for Cosmos3 Omni Nano.
+    ComfyUI BaseModel subclass for Cosmos3.
 
     The model receives token IDs (not embeddings) as `context`, fps as a scalar,
     and optional I2V conditioning tensors.

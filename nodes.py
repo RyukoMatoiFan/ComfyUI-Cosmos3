@@ -1,6 +1,6 @@
 """
 ComfyUI-Cosmos3 — node layer (V1 API)
-All six Cosmos3 nodes live here; __init__.py re-exports the mappings.
+Every Cosmos3 node lives here; __init__.py re-exports the mappings.
 """
 
 import os
@@ -67,9 +67,10 @@ def _get_av_pack():
 
 class Cosmos3Loader:
     """
-    Loads the Cosmos3-Nano transformer, VAE and text tokenizer from a local
-    model directory.  The directory can be an absolute path or a bare name
-    that will be resolved inside the registered cosmos3 model folders.
+    Loads a Cosmos3 transformer, VAE and text tokenizer from a local model
+    directory, which may be an absolute path or a bare name resolved inside the
+    registered cosmos3 model folders. The architecture is read from
+    transformer/config.json, so the same node covers Nano, Super and Edge.
     """
 
     @classmethod
@@ -78,7 +79,7 @@ class Cosmos3Loader:
             "required": {
                 "model_dir": ("STRING", {
                     "default": "Cosmos3-Nano",
-                    "tooltip": "Path to the Cosmos3-Nano model directory "
+                    "tooltip": "Path to a Cosmos3 model directory "
                                "(contains transformer/, vae/, text_tokenizer/ sub-folders). "
                                "Accepts absolute path or a bare directory name resolvable "
                                "inside models/cosmos3/.",
@@ -130,12 +131,12 @@ class Cosmos3Loader:
 
 class Cosmos3UndTowerLoader:
     """
-    Loads only the understanding ("reasoner") tower of a Cosmos3 checkpoint.
+    Handle to the understanding ("reasoner") tower of a Cosmos3 checkpoint.
 
     Cosmos3 is a Mixture-of-Transformers: the text and video pathways share the
     layer stack but use disjoint weights, roughly half each. The text pathway is
     causal over the prompt alone, so its per-layer K/V are the same at every
-    denoising step — it can run once, like a text encoder, and then be offloaded.
+    denoising step — it runs once, before sampling, like a text encoder.
 
     Feed this into Cosmos3 Text Encode and set split_reasoner on the loader that
     provides the MODEL. The denoiser then holds only the gen half.
@@ -146,7 +147,7 @@ class Cosmos3UndTowerLoader:
     before the text encode.
 
     Point it at the same model_dir as the main loader; no separate download is
-    needed, the other half's tensors are skipped as the shards stream past.
+    needed, since only the und tensors are ever read from the checkpoint.
     """
 
     @classmethod
@@ -310,7 +311,7 @@ class Cosmos3DefaultNegativePrompt:
 class Cosmos3EmptyLatentVideo:
     """
     Creates an empty (zero-filled) latent tensor with the correct shape for
-    Cosmos3-Nano: [B, 48, T_lat, H//16, W//16] where
+    Cosmos3: [B, 48, T_lat, H//16, W//16] where
     T_lat = (length - 1) // 4 + 1.
     """
 

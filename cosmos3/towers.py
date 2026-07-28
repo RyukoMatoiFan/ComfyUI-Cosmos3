@@ -9,8 +9,8 @@ loader uses — the two disagreeing would produce a silently broken split.
 Cosmos3 is a Mixture-of-Transformers: the understanding ("und", or reasoner)
 pathway and the generation pathway run through the same layer stack but use
 entirely disjoint weights. The und half is causal over the prompt alone, so its
-per-layer K/V do not change across denoising steps; it runs once and can then be
-unloaded, which is what makes splitting the two worthwhile.
+per-layer K/V do not change across denoising steps: it runs once, before
+sampling, and never has to be resident while the denoiser works.
 """
 
 import json

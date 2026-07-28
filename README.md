@@ -167,7 +167,7 @@ Tensor sizes from a 36-layer, hidden 4096 bf16 checkpoint:
 | | tensors | size | share of loaded weights |
 |---|---|---|---|
 | und | 398 | 14.10 GB | 52.1 % |
-| gen | 410 | 12.97 GB | 47.9 % |
+| gen | 410 | 12.98 GB | 47.9 % |
 | `lm_head`, action head (never loaded) | 6 | 1.19 GB | — |
 
 `forward_und` is causal over the text tokens and takes neither the timestep nor the latent, so its
@@ -177,16 +177,14 @@ replayed — but with both pathways in one `nn.Module` the und tensors stay in t
 for the whole sampling run.
 
 `split_reasoner` on **Cosmos3 Loader** constructs the transformer with `tower="gen"`, omitting the
-und parameters. **Cosmos3 Und Tower Loader** constructs `tower="und"` as a separate `ModelPatcher`;
-**Cosmos3 Text Encode** loads it, calls `prefill_und_packed`, and puts the result in the conditioning
-as `cosmos3_und_kv` — shape `[1, num_layers, 2, L_text, H_kv, head_dim]`. Being two patchers, the
-reasoner is eligible for eviction once the sampler requests the denoiser.
+und parameters; `_filter_transformer_keys` drops the und tensors shard by shard as the checkpoint
+streams past. **Cosmos3 Text Encode** puts the prefilled K/V into the conditioning as
+`cosmos3_und_kv`, shape `[1, num_layers, 2, L_text, H_kv, head_dim]`.
 
-Both loaders read an unmodified checkpoint: `_filter_transformer_keys` drops the other half per shard
-during streaming, so no separate file is required. `tools/split_cosmos3_checkpoint.py` writes `und/`
-and `gen/` trees if you also want the disk and download halved; it imports the same classifier
-(`cosmos3/towers.py`) the loader uses, and carries per-layer quantization metadata with its tensors,
-so int8 and int4/ConvRot checkpoints split unchanged.
+Neither side needs a modified checkpoint — both read the original file. `tools/split_cosmos3_checkpoint.py`
+writes `und/` and `gen/` trees if you also want the disk and download halved; it imports the same
+classifier (`cosmos3/towers.py`) the loader uses, and carries per-layer quantization metadata with
+its tensors, so int8 and int4/ConvRot checkpoints split unchanged.
 
 `Cosmos3 Loader` supplies the tokenizer, so ComfyUI necessarily runs it before `Cosmos3 Text
 Encode`: by the time the reasoner is asked for, the denoiser's weights are already staged. Loading
@@ -221,20 +219,24 @@ these pages are highly reclaimable, reclaim is not guaranteed to win a race agai
 working set. If you run with a tight `memory.max`, size it against total RSS, not the anonymous
 figure.
 
-Sampling is also 3–4 s faster per clip, consistently across repeats, because a smaller model streams
-each step.
+Sampling is also faster — every split run beat every bundled run of the same format across three
+repeats, by 1.5 to 5.2 s on a clip — because a smaller model streams each step.
 
-Costs: the conditioning carries `num_layers × 2 × L_text × H_kv × head_dim` elements on the sampling
+Costs. The conditioning carries `num_layers × 2 × L_text × H_kv × head_dim` elements on the sampling
 device (36 × 2 × 300 × 8 × 128 × 2 B ≈ 44 MB for a 300-token prompt at the shape above), one set per
-prompt, so CFG holds two. A LoRA patching und-side keys must be applied to the und tower's patcher;
-the `patches_uuid` cache invalidation in `model.py` covers only the bundled path.
+prompt, so CFG holds two.
 
-Verified on H100 against a 36-layer, hidden 4096 checkpoint, 832×480×93, 35 steps, `uni_pc_bh2`.
-Both halves load with no missing keys in every weight format tried, and the reasoner's per-layer K/V
-are bitwise identical whether produced by the bundled model or by a separately-loaded und tower.
+**LoRAs are not applied to the reasoner under `split_reasoner`.** The streaming prefill reads weights
+straight from the checkpoint and never goes through a `ModelPatcher`, so a LoRA loaded onto the
+`MODEL` reaches the gen half only; its und-side keys are silently ignored. Use the bundled path if
+your LoRA touches understanding-tower layers.
 
-The denoised latent is **bitwise identical** between the bundled and split paths in bf16, int8 and
-int4/ConvRot alike (`torch.equal` True in all three).
+Verified on H100 against a 36-layer, hidden 4096 checkpoint, 832×480×93, 35 steps, `uni_pc_bh2`, in
+bf16, int8 and int4/ConvRot — fp8 was not tested. In all three the loaded weights are complete and
+the denoised latent is **bitwise identical** between the bundled and split paths (`torch.equal`
+True). The partition is also verified structurally: `und ∪ gen` reproduces the module key sets for
+the Nano/Super and Edge backbones with and without the audio branch, and its SHA matches the real
+checkpoint's key set on both halves.
 
 Quantized weights make this sharper than it sounds. They are tensor subclasses, and their dispatch
 differs between `torch.inference_mode()` and `torch.no_grad()` — under one the ConvRot Hadamard
@@ -243,7 +245,6 @@ rotation is undone before the matmul, under the other it is not. Sampling runs u
 silently yields int4 K/V that do not match what the denoiser sees, with bf16 and int8 unaffected
 because only ConvRot carries a rotation.
 
-The partition covers the Nano/Super and Edge backbones, with and without the audio branch.
 
 ## Quantized weights
 

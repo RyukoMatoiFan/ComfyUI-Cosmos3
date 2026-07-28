@@ -770,18 +770,6 @@ class Cosmos3OmniTransformer(nn.Module):
             self._und_kv_cache[cache_key] = und_kv
         return und_kv
 
-    def prefill_und_packed(self, token_ids, compute_dtype=torch.bfloat16):
-        """
-        Run the und tower and return its K/V as one tensor, for use as
-        conditioning by a separately-loaded generator half.
-
-        Returns [1, num_layers, 2, L_text, H_kv, head_dim] — the leading axis is
-        the conditioning batch dim ComfyUI repeats to the sampling batch size.
-        """
-        und_kv = self._und_prefill(token_ids, compute_dtype, cache_key=None)
-        packed = torch.stack([torch.stack((k, v), dim=0) for k, v in und_kv], dim=0)
-        return packed.unsqueeze(0)
-
     # ------------------------------------------------------------------
     # Patchify / unpatchify (ported exactly from reference)
     # ------------------------------------------------------------------

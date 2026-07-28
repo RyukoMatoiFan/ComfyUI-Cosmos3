@@ -1,8 +1,11 @@
 """
 cosmos3/loader.py
 
-Model loading utilities for Cosmos3 Omni Nano:
-  - load_cosmos3_model: loads 7 transformer shards -> ModelPatcher
+Model loading utilities for the Cosmos3 family. Width, depth and modalities
+come from transformer/config.json, so one loader covers Nano, Super and Edge:
+  - load_cosmos3_model: loads the transformer shards -> ModelPatcher
+  - load_cosmos3_und_tower / stream_und_prefill: the reasoner half, read a
+    layer at a time (see Splitting the reasoner in the README)
   - load_cosmos3_vae: converts diffusers AutoencoderKLWan keys -> comfy VAE
   - load_cosmos3_tokenizer: loads Qwen2 tokenizer -> Cosmos3TextEncoderWrapper
 """
@@ -484,9 +487,12 @@ def stream_und_prefill(desc: dict, token_ids: torch.Tensor,
     """
     Run the understanding tower one layer at a time and return its packed K/V.
 
-    Only the layer being executed is resident, so the reasoner costs a single
-    layer plus the token embedding rather than the whole und half. Output is
-    identical to Cosmos3OmniTransformer._und_prefill on the same tokens.
+    Only the layer being executed is materialised, so the reasoner costs a
+    single layer plus the token embedding rather than the whole und half. That
+    bound is on anonymous memory: tensors are read through safetensors' mmap, so
+    the pages touched stay resident as clean page cache — reclaimable, but
+    counted in RSS and against a cgroup limit. Output is identical to
+    Cosmos3OmniTransformer._und_prefill on the same tokens.
 
     Must be called under torch.inference_mode(): quantized weights are tensor
     subclasses whose dispatch differs from no_grad, and the denoiser runs under

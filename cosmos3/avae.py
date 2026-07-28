@@ -198,7 +198,7 @@ class Cosmos3AudioVAE:
     Parameters
     ----------
     model_dir : str
-        Root directory of the Cosmos3-Nano checkpoint (contains
+        Root directory of a Cosmos3 checkpoint with audio (contains
         ``sound_tokenizer/diffusion_pytorch_model.safetensors``).
     """
 
