@@ -318,6 +318,11 @@ class Cosmos3Omni(comfy.model_base.BaseModel):
         if cond_mask is not None:
             out["cosmos3_cond_mask"] = comfy.conds.CONDRegular(cond_mask)
 
+        # -- Split reasoner: und K/V prefilled by a separate und tower --
+        und_kv = kwargs.get("cosmos3_und_kv", None)
+        if und_kv is not None:
+            out["cosmos3_und_kv"] = comfy.conds.CONDRegular(und_kv)
+
         # -- AV: sound token count (positive int signals AV mode) --
         sound_tokens = kwargs.get("cosmos3_sound_tokens", None)
         if sound_tokens is not None and int(sound_tokens) > 0:

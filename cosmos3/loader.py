@@ -22,6 +22,7 @@ import comfy.utils
 
 from .model_base import Cosmos3ModelConfig, Cosmos3Omni
 from .tokenizer import Cosmos3TextEncoderWrapper
+from .towers import is_dropped_key, is_und_key, resolve_shard_files
 
 
 logger = logging.getLogger(__name__)
@@ -58,27 +59,23 @@ def _should_skip_fp8(key: str, tensor: torch.Tensor) -> bool:
 
 # Drop: lm_head.*, action_* (the action head is not used by this port)
 # KEEP: audio_proj_in.*, audio_proj_out.*, audio_modality_embed (used by the audio branch)
-_FILTER_PREFIXES = ("lm_head.", "action_")
-# Also drop rotary inv_freq buffers
-_FILTER_SUFFIXES = ("rotary_emb.inv_freq",)
+# The rules themselves live in towers.py, shared with the offline splitter.
 
 
-def _filter_transformer_keys(sd: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-    """Remove keys that should not be loaded into Cosmos3OmniTransformer."""
+def _filter_transformer_keys(sd: Dict[str, torch.Tensor],
+                             tower: str = "both") -> Dict[str, torch.Tensor]:
+    """Remove keys that should not be loaded into Cosmos3OmniTransformer.
+
+    With tower="und"/"gen", the other half's keys are dropped as well, so a
+    single full checkpoint can feed either half without being split on disk.
+    """
     out = {}
     for k, v in sd.items():
-        skip = False
-        for prefix in _FILTER_PREFIXES:
-            if k.startswith(prefix):
-                skip = True
-                break
-        if not skip:
-            for suffix in _FILTER_SUFFIXES:
-                if k.endswith(suffix):
-                    skip = True
-                    break
-        if not skip:
-            out[k] = v
+        if is_dropped_key(k):
+            continue
+        if tower != "both" and is_und_key(k) != (tower == "und"):
+            continue
+        out[k] = v
     return out
 
 
@@ -124,38 +121,6 @@ def _load_transformer_config(transformer_dir: str) -> Dict:
     return cfg
 
 
-# Shard index filenames, in the order they are probed.
-_INDEX_FILENAMES = (
-    "diffusion_pytorch_model.safetensors.index.json",
-    "model.safetensors.index.json",
-)
-_SINGLE_FILENAMES = (
-    "diffusion_pytorch_model.safetensors",
-    "model.safetensors",
-)
-
-
-def _resolve_shard_files(transformer_dir: str):
-    """Return the transformer's safetensors files, sharded or single-file."""
-    for name in _INDEX_FILENAMES:
-        index_path = os.path.join(transformer_dir, name)
-        if os.path.exists(index_path):
-            with open(index_path, "r", encoding="utf-8") as f:
-                index = json.load(f)
-            shards = sorted(set(index["weight_map"].values()))
-            return [os.path.join(transformer_dir, s) for s in shards]
-
-    for name in _SINGLE_FILENAMES:
-        single = os.path.join(transformer_dir, name)
-        if os.path.exists(single):
-            return [single]
-
-    raise FileNotFoundError(
-        f"No transformer weights found in {transformer_dir}. Expected one of "
-        f"{_INDEX_FILENAMES} or {_SINGLE_FILENAMES}."
-    )
-
-
 # ---------------------------------------------------------------------------
 # load_cosmos3_model
 # ---------------------------------------------------------------------------
@@ -163,6 +128,7 @@ def _resolve_shard_files(transformer_dir: str):
 def load_cosmos3_model(
     model_dir: str,
     weight_dtype: str = "default",
+    tower: str = "both",
 ) -> comfy.model_patcher.ModelPatcher:
     """
     Load a Cosmos3 Omni transformer from model_dir.
@@ -174,6 +140,11 @@ def load_cosmos3_model(
         model_dir: Path to the checkpoint root (absolute path, or a bare folder
                    name resolved under ComfyUI/models/cosmos3/).
         weight_dtype: "default" (keep bf16) or "fp8_e4m3fn" (cast linear weights to fp8).
+        tower: "both" (single-file model), "und" (understanding tower only) or
+               "gen" (denoiser only). The split halves work against either a
+               pre-split checkpoint or the original full one — in the latter case
+               the other half's tensors are dropped shard by shard, so peak host
+               RAM still drops to roughly half.
 
     Returns:
         comfy.model_patcher.ModelPatcher wrapping a Cosmos3Omni model.
@@ -181,13 +152,15 @@ def load_cosmos3_model(
     transformer_dir = os.path.join(model_dir, "transformer")
 
     unet_config = _load_transformer_config(transformer_dir)
+    unet_config["tower"] = tower
     logger.info(
-        "Transformer config: hidden_size=%s layers=%s heads=%s sound_gen=%s",
+        "Transformer config: hidden_size=%s layers=%s heads=%s sound_gen=%s tower=%s",
         unet_config.get("hidden_size"), unet_config.get("num_hidden_layers"),
         unet_config.get("num_attention_heads"), unet_config.get("sound_gen", True),
+        tower,
     )
 
-    shard_paths = _resolve_shard_files(transformer_dir)
+    shard_paths = resolve_shard_files(transformer_dir)
     logger.info("Found %d transformer shard(s)", len(shard_paths))
 
     # A checkpoint produced by convert_to_quant (ctq) already carries per-layer
@@ -320,7 +293,7 @@ def load_cosmos3_model(
     for shard_path in shard_paths:
         logger.info("  Loading %s", os.path.basename(shard_path))
         shard = comfy.utils.load_torch_file(shard_path, safe_load=True)
-        shard = _filter_transformer_keys(shard)
+        shard = _filter_transformer_keys(shard, tower)
 
         if weight_dtype == "fp8_e4m3fn":
             for k in list(shard.keys()):
@@ -441,6 +414,21 @@ def load_cosmos3_model(
     )
 
     return patcher
+
+
+def load_cosmos3_und_tower(
+    model_dir: str,
+    weight_dtype: str = "default",
+) -> comfy.model_patcher.ModelPatcher:
+    """
+    Load only the understanding tower — the reasoner that turns text tokens into
+    the per-layer K/V the denoiser attends over.
+
+    Wrapped in a ModelPatcher so ComfyUI loads it for the one prefill and then
+    offloads it, exactly as it treats a text encoder. Point this at the same
+    checkpoint directory as the generator half.
+    """
+    return load_cosmos3_model(model_dir, weight_dtype, tower="und")
 
 
 # ---------------------------------------------------------------------------

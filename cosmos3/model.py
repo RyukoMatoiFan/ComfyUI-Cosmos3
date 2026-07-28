@@ -252,6 +252,7 @@ class Cosmos3PackedMoTAttention(nn.Module):
                  qk_norm_for_text: bool = True,
                  use_und_k_norm_for_gen: bool = False,
                  nemotron_norm: bool = False,
+                 build_und: bool = True, build_gen: bool = True,
                  device=None, dtype=None, operations=None):
         super().__init__()
         ops = operations
@@ -260,39 +261,43 @@ class Cosmos3PackedMoTAttention(nn.Module):
         self.head_dim = head_dim
 
         # Understanding pathway
-        self.to_q   = ops.Linear(hidden_size, num_attention_heads * head_dim, bias=False,
-                                  device=device, dtype=dtype)
-        self.to_k   = ops.Linear(hidden_size, num_key_value_heads * head_dim, bias=False,
-                                  device=device, dtype=dtype)
-        self.to_v   = ops.Linear(hidden_size, num_key_value_heads * head_dim, bias=False,
-                                  device=device, dtype=dtype)
-        self.to_out = ops.Linear(num_attention_heads * head_dim, hidden_size, bias=False,
-                                  device=device, dtype=dtype)
-        # Nano/Super norm the und q/k (qk_norm_for_text). Edge sets this False (Identity,
-        # no norm_q/norm_k keys) and instead norms the und K only when it is replayed in
-        # the gen pathway, via a separate k_norm_und_for_gen (use_und_k_norm_for_gen).
-        if qk_norm_for_text:
-            self.norm_q = _rmsnorm(nemotron_norm, head_dim, rms_norm_eps, ops, device, dtype)
-            self.norm_k = _rmsnorm(nemotron_norm, head_dim, rms_norm_eps, ops, device, dtype)
-        else:
-            self.norm_q = nn.Identity()
-            self.norm_k = nn.Identity()
-        if use_und_k_norm_for_gen:
-            self.k_norm_und_for_gen = _rmsnorm(nemotron_norm, head_dim, rms_norm_eps, ops, device, dtype)
-        else:
-            self.k_norm_und_for_gen = None
+        if build_und:
+            self.to_q   = ops.Linear(hidden_size, num_attention_heads * head_dim, bias=False,
+                                      device=device, dtype=dtype)
+            self.to_k   = ops.Linear(hidden_size, num_key_value_heads * head_dim, bias=False,
+                                      device=device, dtype=dtype)
+            self.to_v   = ops.Linear(hidden_size, num_key_value_heads * head_dim, bias=False,
+                                      device=device, dtype=dtype)
+            self.to_out = ops.Linear(num_attention_heads * head_dim, hidden_size, bias=False,
+                                      device=device, dtype=dtype)
+            # Nano/Super norm the und q/k (qk_norm_for_text). Edge sets this False (Identity,
+            # no norm_q/norm_k keys) and instead norms the und K only when it is replayed in
+            # the gen pathway, via a separate k_norm_und_for_gen (use_und_k_norm_for_gen).
+            if qk_norm_for_text:
+                self.norm_q = _rmsnorm(nemotron_norm, head_dim, rms_norm_eps, ops, device, dtype)
+                self.norm_k = _rmsnorm(nemotron_norm, head_dim, rms_norm_eps, ops, device, dtype)
+            else:
+                self.norm_q = nn.Identity()
+                self.norm_k = nn.Identity()
+            # k_norm_und_for_gen is applied during the prefill (forward_und), so it lives
+            # on the und side even though it norms K for the gen pathway's replay.
+            if use_und_k_norm_for_gen:
+                self.k_norm_und_for_gen = _rmsnorm(nemotron_norm, head_dim, rms_norm_eps, ops, device, dtype)
+            else:
+                self.k_norm_und_for_gen = None
 
         # Generation pathway
-        self.add_q_proj  = ops.Linear(hidden_size, num_attention_heads * head_dim, bias=False,
-                                       device=device, dtype=dtype)
-        self.add_k_proj  = ops.Linear(hidden_size, num_key_value_heads * head_dim, bias=False,
-                                       device=device, dtype=dtype)
-        self.add_v_proj  = ops.Linear(hidden_size, num_key_value_heads * head_dim, bias=False,
-                                       device=device, dtype=dtype)
-        self.to_add_out  = ops.Linear(num_attention_heads * head_dim, hidden_size, bias=False,
-                                       device=device, dtype=dtype)
-        self.norm_added_q = _rmsnorm(nemotron_norm, head_dim, rms_norm_eps, ops, device, dtype)
-        self.norm_added_k = _rmsnorm(nemotron_norm, head_dim, rms_norm_eps, ops, device, dtype)
+        if build_gen:
+            self.add_q_proj  = ops.Linear(hidden_size, num_attention_heads * head_dim, bias=False,
+                                           device=device, dtype=dtype)
+            self.add_k_proj  = ops.Linear(hidden_size, num_key_value_heads * head_dim, bias=False,
+                                           device=device, dtype=dtype)
+            self.add_v_proj  = ops.Linear(hidden_size, num_key_value_heads * head_dim, bias=False,
+                                           device=device, dtype=dtype)
+            self.to_add_out  = ops.Linear(num_attention_heads * head_dim, hidden_size, bias=False,
+                                           device=device, dtype=dtype)
+            self.norm_added_q = _rmsnorm(nemotron_norm, head_dim, rms_norm_eps, ops, device, dtype)
+            self.norm_added_k = _rmsnorm(nemotron_norm, head_dim, rms_norm_eps, ops, device, dtype)
 
     def forward_und(self, und_seq, cos_und, sin_und):
         """
@@ -392,6 +397,7 @@ class Cosmos3DecoderLayer(nn.Module):
                  intermediate_size: int, rms_norm_eps: float,
                  gated_mlp: bool = True, qk_norm_for_text: bool = True,
                  use_und_k_norm_for_gen: bool = False, nemotron_norm: bool = False,
+                 build_und: bool = True, build_gen: bool = True,
                  device=None, dtype=None, operations=None):
         super().__init__()
         ops = operations
@@ -404,19 +410,22 @@ class Cosmos3DecoderLayer(nn.Module):
             qk_norm_for_text=qk_norm_for_text,
             use_und_k_norm_for_gen=use_und_k_norm_for_gen,
             nemotron_norm=nemotron_norm,
+            build_und=build_und, build_gen=build_gen,
             device=device, dtype=dtype, operations=ops,
         )
-        # Understanding MLP
-        self.mlp = Cosmos3MLP(hidden_size, intermediate_size, gated=gated_mlp,
-                               device=device, dtype=dtype, operations=ops)
-        # Generation MLP
-        self.mlp_moe_gen = Cosmos3MLP(hidden_size, intermediate_size, gated=gated_mlp,
-                                       device=device, dtype=dtype, operations=ops)
+        if build_und:
+            # Understanding MLP
+            self.mlp = Cosmos3MLP(hidden_size, intermediate_size, gated=gated_mlp,
+                                   device=device, dtype=dtype, operations=ops)
+            self.input_layernorm = _rmsnorm(nemotron_norm, hidden_size, rms_norm_eps, ops, device, dtype)
+            self.post_attention_layernorm = _rmsnorm(nemotron_norm, hidden_size, rms_norm_eps, ops, device, dtype)
 
-        self.input_layernorm = _rmsnorm(nemotron_norm, hidden_size, rms_norm_eps, ops, device, dtype)
-        self.input_layernorm_moe_gen = _rmsnorm(nemotron_norm, hidden_size, rms_norm_eps, ops, device, dtype)
-        self.post_attention_layernorm = _rmsnorm(nemotron_norm, hidden_size, rms_norm_eps, ops, device, dtype)
-        self.post_attention_layernorm_moe_gen = _rmsnorm(nemotron_norm, hidden_size, rms_norm_eps, ops, device, dtype)
+        if build_gen:
+            # Generation MLP
+            self.mlp_moe_gen = Cosmos3MLP(hidden_size, intermediate_size, gated=gated_mlp,
+                                           device=device, dtype=dtype, operations=ops)
+            self.input_layernorm_moe_gen = _rmsnorm(nemotron_norm, hidden_size, rms_norm_eps, ops, device, dtype)
+            self.post_attention_layernorm_moe_gen = _rmsnorm(nemotron_norm, hidden_size, rms_norm_eps, ops, device, dtype)
 
     def forward_und(self, und_seq, cos_und, sin_und):
         """Prefill the und pathway. Returns (und_seq_next, k_und, v_und)."""
@@ -512,10 +521,21 @@ class Cosmos3OmniTransformer(nn.Module):
         hidden_act: str = None,
         qk_norm_for_text: bool = True,
         use_und_k_norm_for_gen: bool = False,
+        # Reasoner/generator split. "both" (default) is the single-file model.
+        # "und" builds only the understanding tower (a text encoder that emits
+        # per-layer K/V); "gen" builds only the denoiser, which then requires
+        # those K/V to be supplied as conditioning. See _und_prefill.
+        tower: str = "both",
         **kwargs,
     ):
         super().__init__()
         self.dtype = dtype
+
+        if tower not in ("both", "und", "gen"):
+            raise ValueError(f"tower must be 'both', 'und' or 'gen', got {tower!r}")
+        self.tower = tower
+        build_und = tower in ("both", "und")
+        build_gen = tower in ("both", "gen")
 
         # Store config
         self.hidden_size = hidden_size
@@ -542,9 +562,10 @@ class Cosmos3OmniTransformer(nn.Module):
 
         ops = operations
 
-        # Text embedding
-        self.embed_tokens = ops.Embedding(vocab_size, hidden_size,
-                                           device=device, dtype=dtype)
+        # Text embedding (und side)
+        if build_und:
+            self.embed_tokens = ops.Embedding(vocab_size, hidden_size,
+                                               device=device, dtype=dtype)
 
         # Edge (nemotron_dense) uses a non-gated squared-ReLU MLP, no text qk-norm, and
         # the Nemotron RMSNorm variant for every norm — all keyed off hidden_act=relu2.
@@ -564,14 +585,19 @@ class Cosmos3OmniTransformer(nn.Module):
                 qk_norm_for_text=qk_norm_for_text,
                 use_und_k_norm_for_gen=use_und_k_norm_for_gen,
                 nemotron_norm=nemotron_norm,
+                build_und=build_und, build_gen=build_gen,
                 device=device, dtype=dtype, operations=ops,
             )
             for _ in range(num_hidden_layers)
         ])
 
-        # Final norms
-        self.norm         = _rmsnorm(nemotron_norm, hidden_size, rms_norm_eps, ops, device, dtype)
-        self.norm_moe_gen = _rmsnorm(nemotron_norm, hidden_size, rms_norm_eps, ops, device, dtype)
+        # Final norms. `norm` is the und tower's output norm, which fed the
+        # (dropped) lm_head — nothing in this port reads it, so it is built only
+        # to keep the full-checkpoint key set complete.
+        if build_und:
+            self.norm = _rmsnorm(nemotron_norm, hidden_size, rms_norm_eps, ops, device, dtype)
+        if build_gen:
+            self.norm_moe_gen = _rmsnorm(nemotron_norm, hidden_size, rms_norm_eps, ops, device, dtype)
 
         # Rotary embedding (no learnable weights)
         self.rotary_emb = Cosmos3RotaryEmbedding(
@@ -580,20 +606,22 @@ class Cosmos3OmniTransformer(nn.Module):
             rope_axes_dim=mrope_section,
         )
 
-        # Vision in/out projection
-        self.proj_in  = ops.Linear(patch_latent_dim, hidden_size, bias=True,
-                                    device=device, dtype=dtype)
-        self.proj_out = ops.Linear(hidden_size, patch_latent_dim, bias=True,
-                                    device=device, dtype=dtype)
+        # Vision in/out projection (gen side)
+        if build_gen:
+            self.proj_in  = ops.Linear(patch_latent_dim, hidden_size, bias=True,
+                                        device=device, dtype=dtype)
+            self.proj_out = ops.Linear(hidden_size, patch_latent_dim, bias=True,
+                                        device=device, dtype=dtype)
 
         # Timestep embedding (time_proj is weight-free sinusoidal; time_embedder has weights)
         # time_proj has NO weight tensors in checkpoint — sinusoidal function only
         # time_embedder.linear_1 / linear_2 match checkpoint keys
-        self.time_embedder = Cosmos3TimestepEmbedding(
-            in_channels=256,
-            time_embed_dim=hidden_size,
-            device=device, dtype=dtype, operations=ops,
-        )
+        if build_gen:
+            self.time_embedder = Cosmos3TimestepEmbedding(
+                in_channels=256,
+                time_embed_dim=hidden_size,
+                device=device, dtype=dtype, operations=ops,
+            )
 
         # Audio generation modules — names match the transformer checkpoint keys:
         #   audio_proj_in.weight [D,sound_dim], audio_proj_in.bias [D]
@@ -601,7 +629,7 @@ class Cosmos3OmniTransformer(nn.Module):
         #   audio_modality_embed [D]
         # Built only for checkpoints that generate sound; image/video-only
         # checkpoints ship none of these keys.
-        self.sound_gen = bool(sound_gen) and sound_dim is not None
+        self.sound_gen = bool(sound_gen) and sound_dim is not None and build_gen
         if self.sound_gen:
             self.audio_proj_in  = ops.Linear(sound_dim, hidden_size, bias=True,
                                               device=device, dtype=dtype)
@@ -635,11 +663,18 @@ class Cosmos3OmniTransformer(nn.Module):
 
     _UND_CACHE_MAX = 2
 
-    def _und_prefill(self, token_ids, compute_dtype, cache_key):
+    def _und_prefill(self, token_ids, compute_dtype, cache_key=None):
         """Return the per-layer [(k_und, v_und), ...] for these text tokens."""
-        cached = self._und_kv_cache.get(cache_key)
-        if cached is not None:
-            return cached
+        if self.tower == "gen":
+            raise RuntimeError(
+                "This model was loaded as the generator half (tower='gen'), so it "
+                "has no understanding tower to prefill. Feed it conditioning from a "
+                "Cosmos3 Text Encode node driven by a Cosmos3 Und Tower Loader."
+            )
+        if cache_key is not None:
+            cached = self._und_kv_cache.get(cache_key)
+            if cached is not None:
+                return cached
 
         device = token_ids.device
         L_text = token_ids.shape[0]
@@ -660,10 +695,23 @@ class Cosmos3OmniTransformer(nn.Module):
             und_seq, k_und, v_und = layer.forward_und(und_seq, cos_und, sin_und)
             und_kv.append((k_und, v_und))
 
-        if len(self._und_kv_cache) >= self._UND_CACHE_MAX:
-            self._und_kv_cache.pop(next(iter(self._und_kv_cache)))
-        self._und_kv_cache[cache_key] = und_kv
+        if cache_key is not None:
+            if len(self._und_kv_cache) >= self._UND_CACHE_MAX:
+                self._und_kv_cache.pop(next(iter(self._und_kv_cache)))
+            self._und_kv_cache[cache_key] = und_kv
         return und_kv
+
+    def prefill_und_packed(self, token_ids, compute_dtype=torch.bfloat16):
+        """
+        Run the und tower and return its K/V as one tensor, for use as
+        conditioning by a separately-loaded generator half.
+
+        Returns [1, num_layers, 2, L_text, H_kv, head_dim] — the leading axis is
+        the conditioning batch dim ComfyUI repeats to the sampling batch size.
+        """
+        und_kv = self._und_prefill(token_ids, compute_dtype, cache_key=None)
+        packed = torch.stack([torch.stack((k, v), dim=0) for k, v in und_kv], dim=0)
+        return packed.unsqueeze(0)
 
     # ------------------------------------------------------------------
     # Patchify / unpatchify (ported exactly from reference)
@@ -719,6 +767,7 @@ class Cosmos3OmniTransformer(nn.Module):
                 cosmos3_cond_latent=None,
                 cosmos3_cond_mask=None,
                 cosmos3_sound_latent=None,
+                cosmos3_und_kv=None,
                 transformer_options: dict = {},
                 **kwargs):
         """
@@ -729,6 +778,9 @@ class Cosmos3OmniTransformer(nn.Module):
         cosmos3_cond_latent:  (B, 48, T, H, W) or (1, 48, T, H, W) clean latent for I2V
         cosmos3_cond_mask:    (B, 1, T, 1, 1) or (1, 1, T, 1, 1) mask: 1 = conditioned frame
         cosmos3_sound_latent: optional (B, 64, T_s) RAW sound latent
+        cosmos3_und_kv:       optional (B, n_layers, 2, L_text, H_kv, d) und K/V
+                              prefilled by a separately-loaded und tower. When
+                              absent the und tower in this model is used.
         Returns:
           - Without sound: velocity (B, 48, T, H, W)   [backward-compatible]
           - With sound:    tuple (v_vision (B,48,T,H,W), v_sound (B,64,T_s))
@@ -826,13 +878,29 @@ class Cosmos3OmniTransformer(nn.Module):
             token_ids = token_ids_list[b].to(x.device)   # [L_text]
             L_text = token_ids.shape[0]
 
-            cache_key = (
-                patches_uuid,
-                str(compute_dtype),
-                str(x.device),
-                token_ids.detach().cpu().numpy().tobytes(),
-            )
-            und_kv = self._und_prefill(token_ids, compute_dtype, cache_key)
+            if cosmos3_und_kv is not None:
+                # K/V came from a separately-loaded und tower — no und weights here.
+                packed = cosmos3_und_kv[min(b, cosmos3_und_kv.shape[0] - 1)]
+                if packed.shape[0] != len(self.layers):
+                    raise ValueError(
+                        f"cosmos3_und_kv has {packed.shape[0]} layers but this model has "
+                        f"{len(self.layers)} — the und tower and the generator come from "
+                        f"different checkpoints."
+                    )
+                if packed.shape[2] != L_text:
+                    raise ValueError(
+                        f"cosmos3_und_kv covers {packed.shape[2]} text tokens but the "
+                        f"conditioning carries {L_text} token IDs."
+                    )
+                und_kv = [(packed[i, 0], packed[i, 1]) for i in range(packed.shape[0])]
+            else:
+                cache_key = (
+                    patches_uuid,
+                    str(compute_dtype),
+                    str(x.device),
+                    token_ids.detach().cpu().numpy().tobytes(),
+                )
+                und_kv = self._und_prefill(token_ids, compute_dtype, cache_key)
 
             L_vision = patches_proj.shape[0]  # T*Hp*Wp
 

@@ -26,6 +26,21 @@ def _get_loader():
     return load_cosmos3_model, load_cosmos3_vae, load_cosmos3_tokenizer
 
 
+def _get_und_tower_loader():
+    from .cosmos3.loader import load_cosmos3_und_tower
+    return load_cosmos3_und_tower
+
+
+def _resolve_model_dir(model_dir: str) -> str:
+    """Resolve a bare directory name against the registered cosmos3 folders."""
+    if not os.path.isabs(model_dir) or not os.path.isdir(model_dir):
+        for base in folder_paths.get_folder_paths("cosmos3"):
+            candidate = os.path.join(base, model_dir)
+            if os.path.isdir(candidate):
+                return candidate
+    return model_dir
+
+
 def _get_compute_sigmas():
     from .cosmos3.scheduler import compute_cosmos3_sigmas
     return compute_cosmos3_sigmas
@@ -68,7 +83,16 @@ class Cosmos3Loader:
                                "fp8_e4m3fn casts linear weights to fp8 to save VRAM. "
                                "int8 uses ComfyUI native tensor-wise int8 (Triton kernels).",
                 }),
-            }
+            },
+            "optional": {
+                "split_reasoner": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Load only the generator half, leaving out the understanding "
+                               "tower (about half the weights). Requires a Cosmos3 Und Tower "
+                               "Loader feeding the Cosmos3 Text Encode node, which prefills "
+                               "the tower once and passes its K/V through the conditioning.",
+                }),
+            },
         }
 
     RETURN_TYPES = ("MODEL", "COSMOS3_TEXT_ENCODER", "VAE", "COSMOS3_AUDIO_VAE")
@@ -76,18 +100,12 @@ class Cosmos3Loader:
     FUNCTION = "load"
     CATEGORY = "Cosmos3"
 
-    def load(self, model_dir: str, weight_dtype: str):
-        # Resolve bare directory name against registered cosmos3 folders
-        if not os.path.isabs(model_dir) or not os.path.isdir(model_dir):
-            cosmos3_paths = folder_paths.get_folder_paths("cosmos3")
-            for base in cosmos3_paths:
-                candidate = os.path.join(base, model_dir)
-                if os.path.isdir(candidate):
-                    model_dir = candidate
-                    break
+    def load(self, model_dir: str, weight_dtype: str, split_reasoner: bool = False):
+        model_dir = _resolve_model_dir(model_dir)
 
         load_model, load_vae, load_tokenizer = _get_loader()
-        model = load_model(model_dir, weight_dtype)
+        model = load_model(model_dir, weight_dtype,
+                           tower="gen" if split_reasoner else "both")
         vae = load_vae(model_dir)
         text_encoder = load_tokenizer(model_dir)
 
@@ -99,6 +117,52 @@ class Cosmos3Loader:
             audio_vae = Cosmos3AudioVAE(model_dir)
 
         return (model, text_encoder, vae, audio_vae)
+
+
+# ---------------------------------------------------------------------------
+# 1b. Cosmos3UndTowerLoader
+# ---------------------------------------------------------------------------
+
+class Cosmos3UndTowerLoader:
+    """
+    Loads only the understanding ("reasoner") tower of a Cosmos3 checkpoint.
+
+    Cosmos3 is a Mixture-of-Transformers: the text and video pathways share the
+    layer stack but use disjoint weights, roughly half each. The text pathway is
+    causal over the prompt alone, so its per-layer K/V are the same at every
+    denoising step — it can run once, like a text encoder, and then be offloaded.
+
+    Feed this into Cosmos3 Text Encode and set split_reasoner on the loader that
+    provides the MODEL, so the two halves are never resident together.
+
+    Point it at the same model_dir as the main loader; no separate download is
+    needed, the other half's tensors are skipped as the shards stream past.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "model_dir": ("STRING", {
+                    "default": "Cosmos3-Nano",
+                    "tooltip": "Same checkpoint directory as the Cosmos3 Loader.",
+                }),
+                "weight_dtype": (["default", "fp8_e4m3fn", "int8"], {
+                    "tooltip": "Quantization for the reasoner's weights. It runs once "
+                               "per prompt, so this trades quality for load time and RAM "
+                               "rather than for sampling speed.",
+                }),
+            }
+        }
+
+    RETURN_TYPES = ("COSMOS3_UND_TOWER",)
+    RETURN_NAMES = ("und_tower",)
+    FUNCTION = "load"
+    CATEGORY = "Cosmos3"
+
+    def load(self, model_dir: str, weight_dtype: str):
+        model_dir = _resolve_model_dir(model_dir)
+        return (_get_und_tower_loader()(model_dir, weight_dtype),)
 
 
 # ---------------------------------------------------------------------------
@@ -151,7 +215,14 @@ class Cosmos3TextEncode:
                     "default": True,
                     "tooltip": "Append duration and FPS sentence to the prompt.",
                 }),
-            }
+            },
+            "optional": {
+                "und_tower": ("COSMOS3_UND_TOWER", {
+                    "tooltip": "Separately-loaded understanding tower. When connected, the "
+                               "reasoner prefill happens here instead of inside the model, "
+                               "and its K/V travel with the conditioning.",
+                }),
+            },
         }
 
     RETURN_TYPES = ("CONDITIONING",)
@@ -159,7 +230,7 @@ class Cosmos3TextEncode:
     CATEGORY = "Cosmos3"
 
     def encode(self, text_encoder, prompt, width, height, num_frames, fps,
-               add_resolution_template, add_duration_template):
+               add_resolution_template, add_duration_template, und_tower=None):
         token_ids = text_encoder.tokenize(
             prompt,
             width=width,
@@ -172,6 +243,24 @@ class Cosmos3TextEncode:
         # ids_tensor: float32 (1, n_tokens, 1) — stores integer IDs as floats
         ids_tensor = torch.tensor(token_ids, dtype=torch.float32).unsqueeze(0).unsqueeze(-1)
         extras = {"cosmos3_fps": float(fps)}
+
+        if und_tower is not None:
+            # Run the reasoner once, here. ComfyUI then offloads it before the
+            # sampler loads the generator half, so the two never share VRAM.
+            comfy.model_management.load_model_gpu(und_tower)
+            device = und_tower.load_device
+            transformer = und_tower.model.diffusion_model
+            ids = torch.tensor(token_ids, dtype=torch.long, device=device)
+            # Compute dtype, not storage dtype: fp8/quantized weights have no
+            # matmul kernel and are cast up to bf16 for the actual math.
+            compute_dtype = und_tower.model.get_dtype()
+            if compute_dtype not in (torch.float32, torch.float16, torch.bfloat16):
+                compute_dtype = torch.bfloat16
+            with torch.no_grad():
+                extras["cosmos3_und_kv"] = transformer.prefill_und_packed(
+                    ids, compute_dtype=compute_dtype
+                )
+
         conditioning = [[ids_tensor, extras]]
         return (conditioning,)
 
@@ -607,6 +696,7 @@ class Cosmos3AudioDecode:
 
 NODE_CLASS_MAPPINGS = {
     "Cosmos3Loader": Cosmos3Loader,
+    "Cosmos3UndTowerLoader": Cosmos3UndTowerLoader,
     "Cosmos3TextEncode": Cosmos3TextEncode,
     "Cosmos3DefaultNegativePrompt": Cosmos3DefaultNegativePrompt,
     "Cosmos3EmptyLatentVideo": Cosmos3EmptyLatentVideo,
@@ -619,6 +709,7 @@ NODE_CLASS_MAPPINGS = {
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "Cosmos3Loader": "Cosmos3 Loader",
+    "Cosmos3UndTowerLoader": "Cosmos3 Und Tower Loader (reasoner)",
     "Cosmos3TextEncode": "Cosmos3 Text Encode",
     "Cosmos3DefaultNegativePrompt": "Cosmos3 Default Negative Prompt",
     "Cosmos3EmptyLatentVideo": "Cosmos3 Empty Latent Video",

@@ -58,8 +58,9 @@ recommended there.
 
 | Node | Purpose · key inputs → outputs |
 |------|--------------------------------|
-| **Cosmos3 Loader** | Load the model. `weight_dtype` = `default` (bf16), `fp8_e4m3fn`, or `int8` (on-the-fly ComfyUI-native int8). Pre-quantized checkpoints (see [Quantized weights](#quantized-weights)) are auto-detected from their metadata — load those with `default`. → `MODEL`, `COSMOS3_TEXT_ENCODER`, `VAE`, `COSMOS3_AUDIO_VAE` (empty on checkpoints without audio) |
-| **Cosmos3 Text Encode** | Tokenize a prompt (chat template + optional resolution/duration metadata). Set `width`/`height`/`num_frames`/`fps` to match the latent. → `CONDITIONING` |
+| **Cosmos3 Loader** | Load the model. `weight_dtype` = `default` (bf16), `fp8_e4m3fn`, or `int8` (on-the-fly ComfyUI-native int8). Pre-quantized checkpoints (see [Quantized weights](#quantized-weights)) are auto-detected from their metadata — load those with `default`. `split_reasoner` loads only the generator half (see [Splitting the reasoner](#splitting-the-reasoner)). → `MODEL`, `COSMOS3_TEXT_ENCODER`, `VAE`, `COSMOS3_AUDIO_VAE` (empty on checkpoints without audio) |
+| **Cosmos3 Und Tower Loader** | Optional. Loads only the understanding tower ("reasoner") from the same `model_dir`, so it can be prefilled once and unloaded. → `COSMOS3_UND_TOWER` |
+| **Cosmos3 Text Encode** | Tokenize a prompt (chat template + optional resolution/duration metadata). Set `width`/`height`/`num_frames`/`fps` to match the latent. Connect `und_tower` to run the reasoner here instead of inside the model. → `CONDITIONING` |
 | **Cosmos3 Default Negative Prompt** | Returns the checkpoint's bundled `assets/negative_prompt.json` as a STRING — wire into a negative Text Encode. Returns an empty string when the checkpoint ships no such file. → `STRING` |
 | **Cosmos3 Empty Latent Video** | Zero latent `[B, 48, (length-1)//4+1, H/16, W/16]`. → `LATENT` |
 | **Cosmos3 Image to Video** | First-frame conditioning: encodes the image and attaches it to positive/negative conds. → `CONDITIONING ×2`, `LATENT` |
@@ -117,6 +118,12 @@ into the negative Text Encode if you want one.
 sampler switched to **euler**, and `CFGGuider` cfg **1.0** (the model is guidance-distilled, so no
 CFG). fps stays 16. Four steps instead of 35.
 
+**`cosmos3_super_i2v_split.json` — reasoner loaded separately.** `cosmos3_super_i2v.json` with
+`split_reasoner` enabled on the loader and a `Cosmos3 Und Tower Loader` wired into the `und_tower`
+input of both Text Encode nodes. Both loaders take the same `Cosmos3-Super-Image2Video` path; the
+split is a load-time option, not a different checkpoint. See
+[Splitting the reasoner](#splitting-the-reasoner). The other examples do not use it.
+
 **`cosmos3_edge_t2v.json` — Cosmos3-Edge text to video.** Same graph as `cosmos3_t2v.json` (fps 24)
 pointed at `Cosmos3-Edge`. Edge is a different backbone (`cosmos3_edge_nemotron_dense`: squared-ReLU
 non-gated MLP, no text QK-norm, its own Nemotron tokenizer) — the loader reads all of this from
@@ -145,6 +152,65 @@ resolution, rather than checkpoint size, are what govern whether a given job fit
 Streaming moves weight data across the bus during sampling, so less available VRAM means more
 transfer per step. `fp8_e4m3fn` reduces how much has to be streamed, and is not required in order
 to fit.
+
+## Splitting the reasoner
+
+Cosmos3 is a Mixture-of-Transformers: the understanding (und) and generation pathways run through the
+same layer stack but use disjoint weights. Per layer the und side is `self_attn.{to_q,to_k,to_v,
+to_out,norm_q,norm_k,k_norm_und_for_gen}`, `mlp`, `input_layernorm` and `post_attention_layernorm`;
+the gen side is the `add_*_proj`/`to_add_out` twins, `mlp_moe_gen` and the `*_moe_gen` norms. Top
+level, `embed_tokens` and `norm` are und; `proj_in`, `proj_out`, `time_embedder`, `norm_moe_gen` and
+the audio branch are gen.
+
+Tensor sizes from a 36-layer, hidden 4096 bf16 checkpoint:
+
+| | tensors | size | share of loaded weights |
+|---|---|---|---|
+| und | 398 | 14.10 GB | 52.1 % |
+| gen | 410 | 12.97 GB | 47.9 % |
+| `lm_head`, action head (never loaded) | 6 | 1.19 GB | — |
+
+`forward_und` is causal over the text tokens and takes neither the timestep nor the latent, so its
+per-layer K/V are constant across denoising steps, and `forward_gen` reads the und side only through
+those K/V. The bundled model exploits this too — `_und_prefill` runs once per prompt and the K/V are
+replayed — but with both pathways in one `nn.Module` the und tensors stay in the patcher's footprint
+for the whole sampling run.
+
+`split_reasoner` on **Cosmos3 Loader** constructs the transformer with `tower="gen"`, omitting the
+und parameters. **Cosmos3 Und Tower Loader** constructs `tower="und"` as a separate `ModelPatcher`;
+**Cosmos3 Text Encode** loads it, calls `prefill_und_packed`, and puts the result in the conditioning
+as `cosmos3_und_kv` — shape `[1, num_layers, 2, L_text, H_kv, head_dim]`. Being two patchers, the
+reasoner is eligible for eviction once the sampler requests the denoiser.
+
+Both loaders read an unmodified checkpoint: `_filter_transformer_keys` drops the other half per shard
+during streaming, so no separate file is required. `tools/split_cosmos3_checkpoint.py` writes `und/`
+and `gen/` trees if you also want the disk and download halved; it imports the same classifier
+(`cosmos3/towers.py`) the loader uses, and carries per-layer quantization metadata with its tensors,
+so int8 and int4/ConvRot checkpoints split unchanged.
+
+Where the reduction lands depends on the loading mode. Under streaming, weights sit in host RAM and
+page to VRAM per forward, so min VRAM is activation-bound and unchanged; the saving is in host RAM.
+With weights held on-card it is VRAM instead. Step time is unchanged either way.
+
+Costs: the conditioning carries `num_layers × 2 × L_text × H_kv × head_dim` elements on the sampling
+device (36 × 2 × 300 × 8 × 128 × 2 B ≈ 44 MB for a 300-token prompt at the shape above), one set per
+prompt, so CFG holds two. A LoRA patching und-side keys must be applied to the und tower's patcher;
+the `patches_uuid` cache invalidation in `model.py` covers only the bundled path.
+
+Verified on a 28.26 GB bf16 checkpoint (36 layers, hidden 4096), H100, single forward at 8×8×2
+latent, 16 text tokens:
+
+| | peak host RSS |
+|---|---|
+| bundled (`tower="both"`) | 32.04 GB |
+| split (und prefill, then `tower="gen"`) | 16.83 GB |
+
+RSS does not rise when the generator is loaded after the reasoner is released, so the two halves are
+not resident together. Velocity output is **bitwise identical** between the two paths (`torch.equal`
+True; reference magnitude mean |v| 0.92), and both halves load with no missing keys.
+
+The partition covers the Nano/Super and Edge backbones, with and without the audio branch. The
+measurements above are for the bf16 format.
 
 ## Quantized weights
 
@@ -192,6 +258,14 @@ decode at the step count shown.
 | Super-Image2Video-4Step — i2v, 4 steps | bf16 | 240 GB | **≈9 GB** | 42 s |
 | | int8 | 67 GB | | 20 s |
 | | int4 | 63 GB | | 16 s |
+
+The table is with the reasoner bundled (the default). With
+[`split_reasoner`](#splitting-the-reasoner) the und parameters are never constructed in the sampled
+model, so the RAM column is bounded by the gen half rather than by both. Measured on a bf16
+checkpoint, peak RSS went 32.04 → 16.83 GB (−47.5 %, against a 47.9 % gen share of loaded weights).
+Applying that ratio to the rows above gives Super int4 ≈33 GB and Nano int4 ≈11 GB; those two are
+extrapolated, not measured on those checkpoints. Min VRAM and time are unaffected — the prefill
+already ran once per prompt.
 
 RAM and VRAM trade off: these are at the minimum VRAM (maximum streaming); giving the GPU more VRAM
 holds more weights on-card, which lowers the RAM figure and speeds sampling. bf16 host RAM peaks near
